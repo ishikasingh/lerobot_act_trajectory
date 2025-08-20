@@ -15,6 +15,7 @@
 # limitations under the License.
 import contextlib
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Callable
@@ -235,6 +236,33 @@ class LeRobotDatasetMetadata:
     def chunks_size(self) -> int:
         """Max number of episodes per chunk."""
         return self.info["chunks_size"]
+    
+    @property
+    def operator(self) -> list[dict]:
+        """List of operators (each as a dict with 'name' and 'email') used in recording this dataset. Returns an empty list if no operators are present."""
+        return self.info.get("operator", [])
+
+    def update_operator(self, name: str, email: str | None = None) -> None:
+        """Append a new operator (name and optional email) to the list of operators used in recording this dataset."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("Operator name must be a non-empty string.")
+        operator_entry = {"name": name}
+        if email is not None:
+            email_regex = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+            if not isinstance(email, str) or not re.match(email_regex, email):
+                raise ValueError(f"Invalid email format. {email}")
+            operator_entry["email"] = email
+        if "operator" not in self.info or not isinstance(self.info["operator"], list):
+            self.info["operator"] = []
+        # Check if operator with the same name already exists
+        for op in self.info["operator"]:
+            if op["name"] == name:
+                if email is not None:
+                    op["email"] = email
+                break
+        else:
+            self.info["operator"].append(operator_entry)
+        write_info(self.info, self.root)
 
     def get_task_index(self, task: str) -> int | None:
         """
