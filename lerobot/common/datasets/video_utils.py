@@ -29,6 +29,8 @@ import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
 
+from lerobot.common.constants import GOP_SIZE, GPU_ENCODING, GPU_ID
+
 
 def get_safe_default_codec():
     if importlib.util.find_spec("torchcodec"):
@@ -256,6 +258,11 @@ def encode_video_frames(
     overwrite: bool = False,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
+
+    # Use env variable to determine if GPU encoding should be used
+    use_gpu = GPU_ENCODING
+    gpu_id = GPU_ID
+
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
     video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -270,11 +277,30 @@ def encode_video_frames(
         ]
     )
 
+    # If use_gpu is True, override vcodec to a GPU-compatible codec if not already set
+    if use_gpu:
+        # Only override if user didn't explicitly set a GPU codec
+        if vcodec not in ["h264_nvenc", "hevc_nvenc"]:
+            vcodec = "h264_nvenc"
+            ffmpeg_args["-vcodec"] = vcodec
+        ffmpeg_args["-gpu"] = str(gpu_id)
+
     if g is not None:
         ffmpeg_args["-g"] = str(g)
+        # For GPU encoding, the GOP (Group of Pictures) size should be a multiple of the framerate (e.g., 30, 60, 90)
+        # to ensure optimal keyframe placement and compatibility with hardware encoders.
+        # This helps with efficient seeking and decoding on most players and streaming platforms.
+        # The GOP size is 30 by default, which is a good balance for 30fps videos.
+        # You can adjust it by setting the GOP_SIZE environment variable.
+        if use_gpu:
+            ffmpeg_args["-g"] = str(GOP_SIZE)
 
     if crf is not None:
-        ffmpeg_args["-crf"] = str(crf)
+        # For NVENC, use -cq instead of -crf for quality control
+        if use_gpu and vcodec in ["h264_nvenc", "hevc_nvenc"]:
+            ffmpeg_args["-cq"] = str(crf)
+        else:
+            ffmpeg_args["-crf"] = str(crf)
 
     if fast_decode:
         key = "-svtav1-params" if vcodec == "libsvtav1" else "-tune"
@@ -289,7 +315,6 @@ def encode_video_frames(
         ffmpeg_args.append("-y")
 
     ffmpeg_cmd = ["ffmpeg"] + ffmpeg_args + [str(video_path)]
-    # redirect stdin to subprocess.DEVNULL to prevent reading random keyboard inputs from terminal
     subprocess.run(ffmpeg_cmd, check=True, stdin=subprocess.DEVNULL)
 
     if not video_path.exists():
