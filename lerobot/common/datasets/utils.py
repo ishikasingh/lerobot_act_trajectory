@@ -421,6 +421,8 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             type = FeatureType.STATE
         elif key == "action":
             type = FeatureType.ACTION
+        elif key in ("left_ee_position", "right_ee_position"):
+            type = FeatureType.TRAJECTORY
         else:
             continue
 
@@ -508,6 +510,7 @@ def check_timestamps_sync(
     # Consecutive differences
     diffs = np.diff(timestamps)
     within_tolerance = np.abs(diffs - (1.0 / fps)) <= tolerance_s
+
 
     # Mask to ignore differences at the boundaries between episodes
     mask = np.ones(len(diffs), dtype=bool)

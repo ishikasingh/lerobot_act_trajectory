@@ -29,7 +29,7 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.common.policies.vqbet.configuration_vqbet import VQBeTConfig
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, PolicyFeature
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
@@ -131,6 +131,17 @@ def make_policy(
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    # For ACT: add synthetic observation.trajectory (chunk_size*6) from left_ee_position + right_ee_position.
+    if (
+        cfg.type == "act"
+        and "left_ee_position" in cfg.input_features
+        and "right_ee_position" in cfg.input_features
+    ):
+        chunk_size = getattr(cfg, "chunk_size", 100)
+        cfg.input_features["observation.trajectory"] = PolicyFeature(
+            type=FeatureType.TRAJECTORY,
+            shape=(chunk_size * 6,),
+        )
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:

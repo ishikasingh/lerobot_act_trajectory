@@ -51,11 +51,14 @@ def resolve_delta_timestamps(
             }
             returns `None` if the the resulting dict is empty.
     """
+    # Keys that use the same chunk_size as action (e.g. for ACT: chunk_size steps per sample).
+    CHUNK_KEYS = ("action", "left_ee_position", "right_ee_position")
+
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
-        if key == "action" and cfg.action_delta_indices is not None:
+        if key in CHUNK_KEYS and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]

@@ -361,11 +361,18 @@ class ACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+        if self.config.trajectory_feature:
+            # trajectory_feature.shape[0] = chunk_size * 6 (left_ee_position + right_ee_position concatenated).
+            self.encoder_trajectory_input_proj = nn.Linear(
+                30 * 6, config.dim_model
+            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
+            n_1d_tokens += 1
+        if self.config.trajectory_feature:
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -415,6 +422,7 @@ class ACT(nn.Module):
         else:
             batch_size = batch["observation.environment_state"].shape[0]
 
+        
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and "action" in batch:
             # Prepare the input to the VAE encoder: [cls, *joint_space_configuration, *action_sequence].
@@ -474,12 +482,26 @@ class ACT(nn.Module):
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
         # Robot state token.
         if self.config.robot_state_feature:
+            # import ipdb; ipdb.set_trace()
             encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
+        if self.config.trajectory_feature:
+            # Build trajectory from left_ee_position (B, chunk_size, 3) and right_ee_position (B, chunk_size, 3).
+            trajectory = torch.cat(
+                [batch["left_ee_position"], batch["right_ee_position"]], dim=-1
+            )  # (B, chunk_size, 6)
+            # Downsample trajectory to 30 steps from 100 steps
+            # Assumes input shape (B, 100, 6): we want (B, 30, 6) by sampling uniformly.
+            if trajectory.shape[1] == 100:
+                idxs = torch.linspace(0, 99, 30).long().to(trajectory.device)
+                trajectory = trajectory[:, idxs, :]
+            # import ipdb; ipdb.set_trace()
+            trajectory = einops.rearrange(trajectory, "b s d -> b (s d)")  # (B, chunk_size*6)
+            encoder_in_tokens.append(self.encoder_trajectory_input_proj(trajectory))
 
         # Camera observation features and positional embeddings.
         if self.config.image_features:
@@ -490,7 +512,7 @@ class ACT(nn.Module):
             for img in batch["observation.images"]:
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)
+                cam_features = self.encoder_img_feat_input_proj(cam_features)   
 
                 # Rearrange features to (sequence, batch, dim).
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")

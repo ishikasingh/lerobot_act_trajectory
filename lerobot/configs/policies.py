@@ -115,6 +115,13 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             if ft.type is FeatureType.ENV:
                 return ft
         return None
+    
+    @property
+    def trajectory_feature(self) -> PolicyFeature | None:
+        for _, ft in self.input_features.items():
+            if ft.type is FeatureType.TRAJECTORY:
+                return ft
+        return None
 
     @property
     def image_features(self) -> dict[str, PolicyFeature]:
