@@ -432,7 +432,8 @@ def dataset_replay(
             "dataset_replay requires a policy. Pass --control.policy.path=/path/to/checkpoint"
         )
 
-    # Load dataset with delta_timestamps so we get chunked left_ee_position and right_ee_position (same as training).
+    # Load dataset and policy BEFORE connecting the robot so the base hardware
+    # doesn't time out while we download data / load model weights.
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
     dataset = LeRobotDataset(
@@ -453,9 +454,9 @@ def dataset_replay(
     device = get_safe_torch_device(policy.config.device)
     fps = cfg.fps if cfg.fps is not None else dataset.fps
 
-    # Disable leader arms; policy drives the robot.
+    # Connect robot AFTER loading dataset/policy (same pattern as record mode)
+    # to minimize idle time between connect and first hardware interaction.
     robot.leader_arms = []
-
     if not robot.is_connected:
         robot.connect()
 
