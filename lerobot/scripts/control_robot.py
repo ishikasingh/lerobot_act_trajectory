@@ -76,6 +76,18 @@ python lerobot/scripts/control_robot.py replay \
     --control.episode=0
 ```
 
+- Dataset replay: run the policy conditioned on trajectory (left_ee_position, right_ee_position) from a dataset episode:
+```bash
+python lerobot/scripts/control_robot.py \
+    --robot.type=trossen_ai_mobile \
+    --control.type=dataset_replay \
+    --control.repo_id=user/dataset_with_fk \
+    --control.episode=0 \
+    --control.policy.path=outputs/train/act_with_trajectory/checkpoints/080000/pretrained_model \
+    --control.fps=30
+```
+(The dataset must contain left_ee_position and right_ee_position; the policy must accept trajectory conditioning.)
+
 - Record a full dataset in order to train a policy, with 2 seconds of warmup,
 30 seconds of recording for each episode, and 10 seconds to reset the environment in between episodes:
 ```bash
@@ -140,20 +152,23 @@ from dataclasses import asdict
 from pprint import pformat
 
 # from safetensors.torch import load_file, save_file
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.robot_devices.control_configs import (
     CalibrateControlConfig,
     ControlPipelineConfig,
+    DatasetReplayControlConfig,
     RecordControlConfig,
     RemoteRobotConfig,
     ReplayControlConfig,
     TeleoperateControlConfig,
 )
+from lerobot.common.datasets.factory import resolve_delta_timestamps
 from lerobot.common.robot_devices.control_utils import (
     control_loop,
     init_keyboard_listener,
     log_control_info,
+    predict_action,
     record_episode,
     reset_environment,
     sanity_check_dataset_name,
@@ -161,6 +176,7 @@ from lerobot.common.robot_devices.control_utils import (
     stop_recording,
     warmup_record,
 )
+from lerobot.common.utils.utils import get_safe_torch_device
 from lerobot.common.robot_devices.robots.utils import Robot, make_robot_from_config
 from lerobot.common.robot_devices.utils import busy_wait, safe_disconnect
 from lerobot.common.utils.utils import has_method, init_logging, log_say
@@ -401,6 +417,71 @@ def replay(
         log_control_info(robot, dt_s, fps=cfg.fps)
 
 
+@safe_disconnect
+def dataset_replay(
+    robot: Robot,
+    cfg: DatasetReplayControlConfig,
+):
+    """Run the policy on the robot conditioned on trajectory (left_ee_position, right_ee_position) from a dataset episode.
+
+    Loads one episode from the LeRobot dataset (must have left_ee_position and right_ee_position).
+    At each step: get current robot observation, get trajectory chunk from dataset, run policy, execute action.
+    """
+    if cfg.policy is None:
+        raise ValueError(
+            "dataset_replay requires a policy. Pass --control.policy.path=/path/to/checkpoint"
+        )
+
+    # Load dataset with delta_timestamps so we get chunked left_ee_position and right_ee_position (same as training).
+    ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    dataset = LeRobotDataset(
+        cfg.repo_id,
+        root=cfg.root,
+        episodes=[cfg.episode],
+        delta_timestamps=delta_timestamps,
+    )
+
+    if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
+        raise ValueError(
+            "dataset_replay requires a dataset with left_ee_position and right_ee_position. "
+            f"Got features: {list(dataset.features.keys())}"
+        )
+
+    policy = make_policy(cfg.policy, ds_meta=dataset.meta)
+    policy.reset()
+    device = get_safe_torch_device(policy.config.device)
+    fps = cfg.fps if cfg.fps is not None else dataset.fps
+
+    # Disable leader arms; policy drives the robot.
+    robot.leader_arms = []
+
+    if not robot.is_connected:
+        robot.connect()
+
+    log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
+    for idx in range(dataset.num_frames):
+        start_t = time.perf_counter()
+
+        # Current observation from robot (state, images).
+        robot_obs = robot.capture_observation()
+        # Trajectory chunk from dataset (left_ee_position, right_ee_position with chunk_size).
+        frame = dataset[idx]
+        # Merge: robot observation + trajectory conditioning. Policy expects batch dim in select_action.
+        batch = dict(robot_obs)
+        batch["left_ee_position"] = frame["left_ee_position"]
+        batch["right_ee_position"] = frame["right_ee_position"]
+
+        action = predict_action(batch, policy, device, policy.config.use_amp)
+        robot.send_action(action)
+
+        dt_s = time.perf_counter() - start_t
+        busy_wait(1 / fps - dt_s)
+        log_control_info(robot, dt_s, fps=fps)
+
+    policy.reset()
+
+
 @parser.wrap()
 def control_robot(cfg: ControlPipelineConfig):
     init_logging()
@@ -416,6 +497,8 @@ def control_robot(cfg: ControlPipelineConfig):
         record(robot, cfg.control)
     elif isinstance(cfg.control, ReplayControlConfig):
         replay(robot, cfg.control)
+    elif isinstance(cfg.control, DatasetReplayControlConfig):
+        dataset_replay(robot, cfg.control)
     elif isinstance(cfg.control, RemoteRobotConfig):
         from lerobot.common.robot_devices.robots.lekiwi_remote import run_lekiwi
 

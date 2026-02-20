@@ -114,6 +114,37 @@ class ReplayControlConfig(ControlConfig):
     play_sounds: bool = True
 
 
+@ControlConfig.register_subclass("dataset_replay")
+@dataclass
+class DatasetReplayControlConfig(ControlConfig):
+    """Replay an episode from a LeRobot dataset while running the policy conditioned on trajectory.
+
+    The dataset must contain left_ee_position and right_ee_position (3D xyz per frame). These are
+    concatenated and fed to the policy as conditioning (e.g. ACT trajectory token). At each step,
+    the robot observation (state, images) is combined with the trajectory chunk from the dataset
+    and the policy selects the action to execute.
+    """
+    # Dataset identifier (e.g. `user/dataset_with_fk`).
+    repo_id: str
+    # Index of the episode to replay.
+    episode: int
+    # Policy to run (must accept trajectory conditioning: left_ee_position, right_ee_position).
+    policy: PreTrainedConfig | None = None
+    # Root directory for the dataset (e.g. 'dataset/path').
+    root: str | Path | None = None
+    # Limit the frames per second. By default, uses the dataset fps.
+    fps: int | None = None
+    # Use vocal synthesis to read events.
+    play_sounds: bool = True
+
+    def __post_init__(self):
+        policy_path = parser.get_path_arg("control.policy")
+        if policy_path:
+            cli_overrides = parser.get_cli_overrides("control.policy")
+            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
+            self.policy.pretrained_path = policy_path
+
+
 @ControlConfig.register_subclass("remote_robot")
 @dataclass
 class RemoteRobotConfig(ControlConfig):
