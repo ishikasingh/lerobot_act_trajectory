@@ -51,14 +51,28 @@ def resolve_delta_timestamps(
             }
             returns `None` if the the resulting dict is empty.
     """
-    # Keys that use the same chunk_size as action (e.g. for ACT: chunk_size steps per sample).
-    CHUNK_KEYS = ("action", "left_ee_position", "right_ee_position")
+    # Determine whether the policy uses trajectory conditioning. If loading a
+    # pretrained config that was trained with trajectory, its input_features
+    # will contain a TRAJECTORY-typed feature. For training from scratch, we
+    # check if the dataset has the required ee_position columns.
+    from lerobot.configs.types import FeatureType
+
+    uses_trajectory = any(
+        ft.type is FeatureType.TRAJECTORY
+        for ft in cfg.input_features.values()
+    ) if cfg.input_features else (
+        "left_ee_position" in ds_meta.features and "right_ee_position" in ds_meta.features
+    )
+
+    chunk_keys = ["action"]
+    if uses_trajectory:
+        chunk_keys.extend(["left_ee_position", "right_ee_position"])
 
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
-        if key in CHUNK_KEYS and cfg.action_delta_indices is not None:
+        if key in chunk_keys and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]

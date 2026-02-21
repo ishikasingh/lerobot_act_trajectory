@@ -117,6 +117,14 @@ def make_policy(
     policy_cls = get_policy_class(cfg.type)
 
     kwargs = {}
+
+    # Before overwriting features from the dataset, check whether the pretrained
+    # model was trained with trajectory conditioning. The pretrained config's
+    # input_features (loaded from config.json) tells us what the model expects.
+    pretrained_has_trajectory = (
+        cfg.pretrained_path is not None and cfg.trajectory_feature is not None
+    )
+
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
         kwargs["dataset_stats"] = ds_meta.stats
@@ -131,17 +139,29 @@ def make_policy(
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
-    # For ACT: add synthetic observation.trajectory (chunk_size*6) from left_ee_position + right_ee_position.
-    if (
+
+    # For ACT: add synthetic observation.trajectory (chunk_size*6) from
+    # left_ee_position + right_ee_position. Only do this when training from
+    # scratch (no pretrained_path) or when the pretrained model was trained
+    # with trajectory conditioning.
+    should_add_trajectory = (
         cfg.type == "act"
         and "left_ee_position" in cfg.input_features
         and "right_ee_position" in cfg.input_features
-    ):
+        and (cfg.pretrained_path is None or pretrained_has_trajectory)
+    )
+    if should_add_trajectory:
         chunk_size = getattr(cfg, "chunk_size", 100)
         cfg.input_features["observation.trajectory"] = PolicyFeature(
             type=FeatureType.TRAJECTORY,
             shape=(chunk_size * 6,),
         )
+    elif cfg.pretrained_path and not pretrained_has_trajectory:
+        # Unconditioned pretrained model: remove ee_position features so the
+        # model doesn't try to normalize/use features it wasn't trained with.
+        cfg.input_features.pop("left_ee_position", None)
+        cfg.input_features.pop("right_ee_position", None)
+
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:

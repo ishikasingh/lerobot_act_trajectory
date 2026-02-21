@@ -489,6 +489,7 @@ def control_robot(cfg: ControlPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
     robot = make_robot_from_config(cfg.robot)
+    
 
     if isinstance(cfg.control, CalibrateControlConfig):
         calibrate(robot, cfg.control)
