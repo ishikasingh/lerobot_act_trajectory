@@ -51,18 +51,25 @@ def resolve_delta_timestamps(
             }
             returns `None` if the the resulting dict is empty.
     """
-    # Determine whether the policy uses trajectory conditioning. If loading a
-    # pretrained config that was trained with trajectory, its input_features
-    # will contain a TRAJECTORY-typed feature. For training from scratch, we
-    # check if the dataset has the required ee_position columns.
-    from lerobot.configs.types import FeatureType
+    # Determine whether the policy uses trajectory conditioning.
+    # Respect the explicit use_trajectory flag (ACTConfig); for pretrained
+    # configs check stored input_features; for training from scratch check
+    # dataset features.
+    from lerobot.configs.types import FeatureType, PolicyFeature
 
-    uses_trajectory = any(
-        ft.type is FeatureType.TRAJECTORY
-        for ft in cfg.input_features.values()
-    ) if cfg.input_features else (
-        "left_ee_position" in ds_meta.features and "right_ee_position" in ds_meta.features
-    )
+    use_trajectory_flag = getattr(cfg, "use_trajectory", True)
+    if not use_trajectory_flag:
+        uses_trajectory = False
+    elif cfg.input_features:
+        uses_trajectory = any(
+            ft.type is FeatureType.TRAJECTORY
+            for ft in cfg.input_features.values()
+        )
+    else:
+        uses_trajectory = (
+            "left_ee_position" in ds_meta.features
+            and "right_ee_position" in ds_meta.features
+        )
 
     chunk_keys = ["action"]
     if uses_trajectory:

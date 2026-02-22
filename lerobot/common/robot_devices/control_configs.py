@@ -134,6 +134,8 @@ class DatasetReplayControlConfig(ControlConfig):
     root: str | Path | None = None
     # Limit the frames per second. By default, uses the dataset fps.
     fps: int | None = None
+    # Directory to save rollout videos with EE trajectory overlay (None = no video).
+    video_output_dir: str | Path | None = None
     # Use vocal synthesis to read events.
     play_sounds: bool = True
 

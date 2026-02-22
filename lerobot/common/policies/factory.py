@@ -141,11 +141,13 @@ def make_policy(
     cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
     # For ACT: add synthetic observation.trajectory (chunk_size*6) from
-    # left_ee_position + right_ee_position. Only do this when training from
-    # scratch (no pretrained_path) or when the pretrained model was trained
-    # with trajectory conditioning.
+    # left_ee_position + right_ee_position. Only do this when:
+    #   1. use_trajectory is True (explicitly enabled via config), AND
+    #   2. Training from scratch OR pretrained model was trained with trajectory.
+    use_trajectory = getattr(cfg, "use_trajectory", True)
     should_add_trajectory = (
         cfg.type == "act"
+        and use_trajectory
         and "left_ee_position" in cfg.input_features
         and "right_ee_position" in cfg.input_features
         and (cfg.pretrained_path is None or pretrained_has_trajectory)
@@ -156,8 +158,8 @@ def make_policy(
             type=FeatureType.TRAJECTORY,
             shape=(chunk_size * 6,),
         )
-    elif cfg.pretrained_path and not pretrained_has_trajectory:
-        # Unconditioned pretrained model: remove ee_position features so the
+    if not should_add_trajectory:
+        # No trajectory conditioning: remove ee_position features so the
         # model doesn't try to normalize/use features it wasn't trained with.
         cfg.input_features.pop("left_ee_position", None)
         cfg.input_features.pop("right_ee_position", None)

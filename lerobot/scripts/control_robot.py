@@ -149,7 +149,12 @@ python lerobot/scripts/control_robot.py \
 import logging
 import time
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
+
+import cv2
+import numpy as np
+import torch
 
 # from safetensors.torch import load_file, save_file
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -181,6 +186,14 @@ from lerobot.common.robot_devices.robots.utils import Robot, make_robot_from_con
 from lerobot.common.robot_devices.utils import busy_wait, safe_disconnect
 from lerobot.common.utils.utils import has_method, init_logging, log_say
 from lerobot.configs import parser
+
+from data_processing.compute_fk_from_dataset import (
+    _project_ee_to_image,
+    DEFAULT_FX,
+    DEFAULT_FY,
+    DEFAULT_CX,
+    DEFAULT_CY,
+)
 
 ########################################################################################
 # Control modes
@@ -417,6 +430,90 @@ def replay(
         log_control_info(robot, dt_s, fps=cfg.fps)
 
 
+def _obs_tensor_to_numpy_bgr(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a robot observation image tensor (C,H,W float [0,1] or uint8) to BGR numpy for cv2."""
+    img = tensor.cpu().numpy() if isinstance(tensor, torch.Tensor) else np.asarray(tensor)
+    if img.ndim == 3 and img.shape[0] in (1, 3):
+        img = np.transpose(img, (1, 2, 0))
+    if img.dtype in (np.float32, np.float64):
+        img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return np.ascontiguousarray(img)
+
+
+def _draw_ee_trajectory_on_image(
+    img: np.ndarray,
+    cam_pos: np.ndarray,
+    cam_quat: np.ndarray,
+    left_ee: np.ndarray,
+    right_ee: np.ndarray,
+) -> np.ndarray:
+    """Draw projected EE trajectory points onto a BGR image.
+
+    left_ee / right_ee can be (3,) for a single point or (N, 3) for a trajectory chunk.
+    The first point in the chunk (current timestep) gets a large circle; subsequent
+    points are drawn as a fading polyline showing the future trajectory.
+    """
+    img = img.copy()
+    cam_pos = np.asarray(cam_pos, dtype=np.float64).reshape(-1)[:3]
+    cam_quat = np.asarray(cam_quat, dtype=np.float64).reshape(-1)[:4]
+
+    def _ensure_2d(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float64)
+        if arr.ndim == 1:
+            return arr.reshape(1, -1)
+        return arr
+
+    left_pts = _ensure_2d(left_ee)
+    right_pts = _ensure_2d(right_ee)
+
+    def project_single(pt: np.ndarray) -> tuple[int, int] | None:
+        uv, _ = _project_ee_to_image(
+            cam_pos, cam_quat, pt, pt,
+            DEFAULT_FX, DEFAULT_FY, DEFAULT_CX, DEFAULT_CY,
+        )
+        return uv
+
+    left_uvs = [project_single(left_pts[i]) for i in range(len(left_pts))]
+    right_uvs = [project_single(right_pts[i]) for i in range(len(right_pts))]
+
+    def draw_trajectory(uvs, color_bgr, label):
+        valid = [(i, uv) for i, uv in enumerate(uvs) if uv is not None]
+        if not valid:
+            return
+        # Draw polyline for future trajectory.
+        if len(valid) > 1:
+            line_pts = np.array([uv for _, uv in valid], dtype=np.int32)
+            cv2.polylines(img, [line_pts], isClosed=False, color=color_bgr, thickness=2)
+        # Current position: large filled circle.
+        i0, uv0 = valid[0]
+        cv2.circle(img, uv0, 10, color_bgr, -1)
+        cv2.putText(img, label, (uv0[0] + 12, uv0[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
+        # Future positions: small dots.
+        for i, uv in valid[1:]:
+            alpha = max(0.2, 1.0 - i / len(uvs))
+            r = max(2, int(6 * alpha))
+            cv2.circle(img, uv, r, color_bgr, -1)
+
+    draw_trajectory(left_uvs, (255, 0, 0), "L")   # blue in BGR
+    draw_trajectory(right_uvs, (0, 0, 255), "R")   # red in BGR
+    return img
+
+
+def _save_video_cv2(path: str, frames: list[np.ndarray], fps: int):
+    """Save a list of BGR numpy frames as an mp4 video."""
+    if not frames:
+        return
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    logging.info(f"Wrote {len(frames)} frames to {path}")
+
+
 @safe_disconnect
 def dataset_replay(
     robot: Robot,
@@ -460,15 +557,22 @@ def dataset_replay(
     if not robot.is_connected:
         robot.connect()
 
+    # Video recording setup: collect annotated frames per camera.
+    record_video = cfg.video_output_dir is not None
+    video_frames: dict[str, list[np.ndarray]] = {}
+    has_camera_pose = (
+        "head_camera_position" in dataset.features
+        and "head_camera_quat_xyzw" in dataset.features
+    )
+    cam_high_key = "observation.images.cam_high"
+
     log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
     for idx in range(dataset.num_frames):
         start_t = time.perf_counter()
 
-        # Current observation from robot (state, images).
         robot_obs = robot.capture_observation()
-        # Trajectory chunk from dataset (left_ee_position, right_ee_position with chunk_size).
         frame = dataset[idx]
-        # Merge: robot observation + trajectory conditioning. Policy expects batch dim in select_action.
+
         batch = dict(robot_obs)
         batch["left_ee_position"] = frame["left_ee_position"]
         batch["right_ee_position"] = frame["right_ee_position"]
@@ -476,11 +580,48 @@ def dataset_replay(
         action = predict_action(batch, policy, device, policy.config.use_amp)
         robot.send_action(action)
 
+        if record_video:
+            for cam_key in robot_obs:
+                if "image" not in cam_key:
+                    continue
+                img_tensor = robot_obs[cam_key]
+                img = _obs_tensor_to_numpy_bgr(img_tensor)
+
+                if cam_key == cam_high_key and has_camera_pose:
+                    cam_pos = frame["head_camera_position"]
+                    cam_quat = frame["head_camera_quat_xyzw"]
+                    if isinstance(cam_pos, torch.Tensor):
+                        cam_pos = cam_pos.cpu().numpy()
+                    if isinstance(cam_quat, torch.Tensor):
+                        cam_quat = cam_quat.cpu().numpy()
+
+                    left_ee = frame["left_ee_position"]
+                    right_ee = frame["right_ee_position"]
+                    if isinstance(left_ee, torch.Tensor):
+                        left_ee = left_ee.cpu().numpy()
+                    if isinstance(right_ee, torch.Tensor):
+                        right_ee = right_ee.cpu().numpy()
+
+                    img = _draw_ee_trajectory_on_image(
+                        img, cam_pos, cam_quat, left_ee, right_ee,
+                    )
+
+                video_frames.setdefault(cam_key, []).append(img)
+
         dt_s = time.perf_counter() - start_t
         busy_wait(1 / fps - dt_s)
         log_control_info(robot, dt_s, fps=fps)
 
     policy.reset()
+
+    if record_video and video_frames:
+        out_dir = Path(cfg.video_output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for cam_key, frames_list in video_frames.items():
+            safe_name = cam_key.replace(".", "_").replace("/", "_")
+            video_path = out_dir / f"rollout_ep{cfg.episode}_{safe_name}.mp4"
+            _save_video_cv2(str(video_path), frames_list, fps)
+            logging.info(f"Saved rollout video to {video_path}")
 
 
 @parser.wrap()

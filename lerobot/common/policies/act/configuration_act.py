@@ -95,6 +95,10 @@ class ACTConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
+    # Whether to use trajectory conditioning (left_ee_position + right_ee_position).
+    # Set to False to train an unconditioned model even when the dataset has FK features.
+    use_trajectory: bool = True
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
