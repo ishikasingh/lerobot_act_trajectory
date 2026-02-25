@@ -189,6 +189,12 @@ from lerobot.configs import parser
 
 from data_processing.compute_fk_from_dataset import (
     _project_ee_to_image,
+    _load_urdf,
+    _build_state_to_q_mapping,
+    compute_fk_for_frame,
+    LEFT_EE_LINK,
+    RIGHT_EE_LINK,
+    HEAD_CAMERA_LINK,
     DEFAULT_FX,
     DEFAULT_FY,
     DEFAULT_CX,
@@ -501,6 +507,62 @@ def _draw_ee_trajectory_on_image(
     return img
 
 
+def _draw_ee_trajectory_on_image_colored(
+    img: np.ndarray,
+    cam_pos: np.ndarray,
+    cam_quat: np.ndarray,
+    left_ee: np.ndarray,
+    right_ee: np.ndarray,
+    left_color: tuple[int, int, int] = (0, 255, 0),
+    right_color: tuple[int, int, int] = (0, 255, 255),
+    left_label: str = "L_gt",
+    right_label: str = "R_gt",
+) -> np.ndarray:
+    """Same as _draw_ee_trajectory_on_image but with configurable BGR colors and labels."""
+    img = img.copy()
+    cam_pos = np.asarray(cam_pos, dtype=np.float64).reshape(-1)[:3]
+    cam_quat = np.asarray(cam_quat, dtype=np.float64).reshape(-1)[:4]
+
+    def _ensure_2d(arr: np.ndarray) -> np.ndarray:
+        arr = np.asarray(arr, dtype=np.float64)
+        if arr.ndim == 1:
+            return arr.reshape(1, -1)
+        return arr
+
+    left_pts = _ensure_2d(left_ee)
+    right_pts = _ensure_2d(right_ee)
+
+    def project_single(pt: np.ndarray) -> tuple[int, int] | None:
+        uv, _ = _project_ee_to_image(
+            cam_pos, cam_quat, pt, pt,
+            DEFAULT_FX, DEFAULT_FY, DEFAULT_CX, DEFAULT_CY,
+        )
+        return uv
+
+    left_uvs = [project_single(left_pts[i]) for i in range(len(left_pts))]
+    right_uvs = [project_single(right_pts[i]) for i in range(len(right_pts))]
+
+    def draw_trajectory(uvs, color_bgr, label):
+        valid = [(i, uv) for i, uv in enumerate(uvs) if uv is not None]
+        if not valid:
+            return
+        if len(valid) > 1:
+            line_pts = np.array([uv for _, uv in valid], dtype=np.int32)
+            cv2.polylines(img, [line_pts], isClosed=False, color=color_bgr, thickness=2)
+        i0, uv0 = valid[0]
+        cv2.circle(img, uv0, 10, color_bgr, -1)
+        cv2.putText(img, label, (uv0[0] + 12, uv0[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
+        for i, uv in valid[1:]:
+            alpha = max(0.2, 1.0 - i / len(uvs))
+            r = max(2, int(6 * alpha))
+            cv2.circle(img, uv, r, color_bgr, -1)
+
+    draw_trajectory(left_uvs, left_color, left_label)
+    draw_trajectory(right_uvs, right_color, right_label)
+    return img
+
+
 def _save_video_cv2(path: str, frames: list[np.ndarray], fps: int):
     """Save a list of BGR numpy frames as an mp4 video."""
     if not frames:
@@ -648,6 +710,26 @@ def dataset_replay(
     device = get_safe_torch_device(policy.config.device)
     fps = cfg.fps if cfg.fps is not None else dataset.fps
 
+    # --------------- FK setup: compute EE positions from observation.state ---------------
+    urdf_path = "/root/lerobot/data_processing/stationary_ai.urdf"
+    fk_model = _load_urdf(urdf_path)
+    fk_data = fk_model.createData()
+
+    state_key = "observation.state"
+    state_names = dataset.features[state_key].get("names")
+    state_to_q = _build_state_to_q_mapping(fk_model, state_names)
+    fk_frame_ids = {
+        name: fk_model.getFrameId(name)
+        for name in [LEFT_EE_LINK, RIGHT_EE_LINK, HEAD_CAMERA_LINK]
+    }
+
+    def _state_to_ee(state_tensor: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+        """Run FK on an observation.state tensor and return (left_ee, right_ee) as float32 (3,)."""
+        s = state_tensor.cpu().numpy() if isinstance(state_tensor, torch.Tensor) else np.asarray(state_tensor)
+        s = np.asarray(s, dtype=np.float64).ravel()
+        fk_out = compute_fk_for_frame(fk_model, fk_data, s, state_names, state_to_q, fk_frame_ids)
+        return fk_out["left_ee_position"].astype(np.float32), fk_out["right_ee_position"].astype(np.float32)
+
     # Load Molmo model for EE prediction if checkpoint provided.
     molmo_predictor = None
     if cfg.molmo_checkpoint is not None:
@@ -658,9 +740,9 @@ def dataset_replay(
         )
         logging.info("Using Molmo model for EE position prediction")
 
-    # # Connect robot AFTER loading all models to minimize idle time.
-    if not robot.is_connected:
-        robot.connect()
+    # # # Connect robot AFTER loading all models to minimize idle time.
+    # if not robot.is_connected:
+    #     robot.connect()
 
     # Video recording setup: collect annotated frames per camera.
     record_video = cfg.video_output_dir is not None
@@ -671,16 +753,28 @@ def dataset_replay(
     )
     cam_high_key = "observation.images.cam_high"
 
-    log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
+    # log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
     for idx in range(dataset.num_frames):
         start_t = time.perf_counter()
 
-        robot_obs = robot.capture_observation()
+        # if idx % 100 != 0:
+        #     continue
+
         frame = dataset[idx]
+        if robot.is_connected:
+            robot_obs = robot.capture_observation()
+        else:
+            robot_obs = {
+                "observation.state": frame["observation.state"],
+                "observation.images.cam_high": frame["observation.images.cam_high"].permute(1, 2, 0),
+                "observation.images.cam_low": frame["observation.images.cam_low"].permute(1, 2, 0),
+                'observation.images.cam_left_wrist': frame['observation.images.cam_left_wrist'].permute(1, 2, 0),
+                'observation.images.cam_right_wrist': frame['observation.images.cam_right_wrist'].permute(1, 2, 0),
+            }
 
         batch = dict(robot_obs)
 
-        if molmo_predictor is not None and idx % 30 == 0:
+        if molmo_predictor is not None and idx % 100 == 0:
             # Predict EE positions from the live camera image using Molmo.
             cam_img = robot_obs.get(cam_high_key)
             if cam_img is None:
@@ -691,19 +785,81 @@ def dataset_replay(
             if img_np.dtype in (np.float32, np.float64):
                 img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
 
-            trajectory_np = molmo_predictor.predict(
+            left_ee_curr, right_ee_curr = _state_to_ee(frame["observation.state"])
+            proprio_state = np.concatenate([left_ee_curr, right_ee_curr])
+
+            
+
+            left_ee_np, right_ee_np = molmo_predictor.predict(
                 image=img_np,
                 instruction=cfg.molmo_instruction,
-                proprio_state=frame["observation.state"],
+                proprio_state=proprio_state,
             )
-            batch["left_ee_position"] = torch.from_numpy(trajectory_np[..., :3]).to(device)
-            batch["right_ee_position"] = torch.from_numpy(trajectory_np[..., 3:6]).to(device)
+            batch["left_ee_position"] = torch.from_numpy(left_ee_np).to(device)
+            batch["right_ee_position"] = torch.from_numpy(right_ee_np).to(device)
+            def interp1d_torch(vec, target_len=100):
+                # vec: (N, C) e.g. (30, 3) -> treat as (1, C, N), interpolate to (1, C, target_len), -> (target_len, C)
+                return torch.nn.functional.interpolate(
+                    vec.T.unsqueeze(0).float(),  # (1, C, N)
+                    size=target_len,
+                    mode='linear',
+                    align_corners=True,
+                )[0].T  # (target_len, C)
+
+            batch["left_ee_position"] = interp1d_torch(batch["left_ee_position"], 100)
+            batch["right_ee_position"] = interp1d_torch(batch["right_ee_position"], 100)
+
+            if idx % 100 == 0:
+                fk_out = compute_fk_for_frame(
+                    fk_model, fk_data,
+                    np.asarray(frame["observation.state"].cpu().numpy() if isinstance(frame["observation.state"], torch.Tensor) else frame["observation.state"], dtype=np.float64).ravel(),
+                    state_names, state_to_q, fk_frame_ids,
+                )
+                cam_pos = fk_out["head_camera_position"]
+                cam_quat = fk_out["head_camera_quat_xyzw"]
+
+                # Molmo-predicted (interpolated) EE trajectory
+                left_vis = batch["left_ee_position"].cpu().numpy()
+                right_vis = batch["right_ee_position"].cpu().numpy()
+
+                # Ground-truth EE trajectory from dataset
+                gt_left = frame["left_ee_position"]
+                gt_right = frame["right_ee_position"]
+                if isinstance(gt_left, torch.Tensor):
+                    gt_left = gt_left.cpu().numpy()
+                if isinstance(gt_right, torch.Tensor):
+                    gt_right = gt_right.cpu().numpy()
+
+                vis_img = img_np.copy()
+                vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+                # Draw Molmo predictions: blue (L) / red (R)
+                vis_img = _draw_ee_trajectory_on_image(vis_img, cam_pos, cam_quat, left_vis, right_vis)
+                # Draw ground-truth: green (L) / yellow (R)
+                vis_img = _draw_ee_trajectory_on_image_colored(
+                    vis_img, cam_pos, cam_quat, gt_left, gt_right,
+                    left_color=(0, 255, 0), right_color=(0, 255, 255),
+                    left_label="L_gt", right_label="R_gt",
+                )
+
+                save_dir = Path(cfg.video_output_dir or "ee_debug_frames")
+                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = save_dir / f"frame_{idx:06d}.png"
+                cv2.imwrite(str(save_path), vis_img)
+                logging.info(f"Saved EE overlay frame to {save_path}")
         else:
             batch["left_ee_position"] = frame["left_ee_position"]
             batch["right_ee_position"] = frame["right_ee_position"]
 
+
+        # import ipdb; ipdb.set_trace()
+
         action = predict_action(batch, policy, device, policy.config.use_amp)
-        robot.send_action(action)
+
+        if robot.is_connected:
+            robot.send_action(action)
+        
+
+        
 
         # Resolve EE values for video overlay (use whichever source we used above).
         if molmo_predictor is not None:
