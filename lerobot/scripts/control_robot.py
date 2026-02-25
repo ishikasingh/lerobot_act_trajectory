@@ -514,6 +514,101 @@ def _save_video_cv2(path: str, frames: list[np.ndarray], fps: int):
     logging.info(f"Wrote {len(frames)} frames to {path}")
 
 
+class MolmoEEPredictor:
+    """Predicts left/right EE positions using a Molmo VLA checkpoint.
+
+    Wraps model loading, preprocessing, and flow-matching inference following
+    the pattern in eval_closed_loop.py.  Output is split into left_ee_position
+    (action_horizon, 3) and right_ee_position (action_horizon, 3).
+    """
+
+    def __init__(self, checkpoint: str, device: str = "cuda", num_ode_steps: int = 10):
+        from olmo.model import Molmo
+        from olmo.data import build_mm_preprocessor
+
+        logging.info(f"Loading Molmo model from {checkpoint}")
+        self.model = Molmo.from_checkpoint(checkpoint, device=device)
+        self.model.eval()
+        self.preprocessor = build_mm_preprocessor(
+            self.model.config, for_inference=True, is_training=False
+        )
+        self.device = torch.device(device)
+        self.num_ode_steps = num_ode_steps
+        self.action_horizon = self.model.config.action_horizon
+        self.action_dim = self.model.config.action_dim
+
+    @torch.no_grad()
+    def predict(
+        self,
+        image: np.ndarray,
+        instruction: str,
+        proprio_state: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run Molmo and return (left_ee, right_ee) each of shape (action_horizon, 3).
+
+        Args:
+            image: RGB uint8 array (H, W, 3) from the head camera.
+            instruction: Language instruction / task description.
+            proprio_state: Optional proprioceptive state vector.
+
+        Returns:
+            (left_ee_position, right_ee_position) as float32 numpy arrays.
+        """
+        from PIL import Image as PILImage
+
+        pil_image = PILImage.fromarray(image)
+        example = {
+            "image": pil_image,
+            "prompt": instruction,
+            "style": "trajectory_3d_egodex_trossen_direct",
+            "proprio_state": proprio_state,
+        }
+        if proprio_state is not None:
+            example["state"] = proprio_state
+
+        batch = self.preprocessor(example)
+
+        input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(self.device)
+        images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(self.device)
+        image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(self.device)
+
+        image_masks = None
+        if "image_masks" in batch:
+            image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(self.device)
+        position_ids = None
+        if "position_ids" in batch:
+            position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(self.device)
+        proprio_tensor = None
+        if "proprio_state" in batch:
+            proprio_tensor = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        expert_type = torch.tensor([1], dtype=torch.long).to(self.device)
+        initial_noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device)
+
+        actions = self.model.sample_actions_flow_matching(
+            input_ids=input_ids,
+            attention_mask=None,
+            images=images,
+            image_masks=image_masks,
+            image_input_idx=image_input_idx,
+            num_steps=self.num_ode_steps,
+            initial_noise=initial_noise,
+            position_ids=position_ids,
+            proprio_state=proprio_tensor,
+            expert_type=expert_type,
+        )
+
+        if isinstance(actions, tuple):
+            actions = actions[0]
+
+        actions_np = actions.cpu().numpy()[0]  # (action_horizon, action_dim)
+
+        # First 3 dims = left EE xyz, next 3 = right EE xyz.
+        left_ee = actions_np[:, :3].astype(np.float32)
+        right_ee = actions_np[:, 3:6].astype(np.float32)
+        return left_ee, right_ee
+
+
 @safe_disconnect
 def dataset_replay(
     robot: Robot,
@@ -540,20 +635,30 @@ def dataset_replay(
         delta_timestamps=delta_timestamps,
     )
 
-    if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
-        raise ValueError(
-            "dataset_replay requires a dataset with left_ee_position and right_ee_position. "
-            f"Got features: {list(dataset.features.keys())}"
-        )
+    if cfg.molmo_checkpoint is None:
+        if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
+            raise ValueError(
+                "dataset_replay requires a dataset with left_ee_position and right_ee_position "
+                "(or --control.molmo_checkpoint to predict them). "
+                f"Got features: {list(dataset.features.keys())}"
+            )
 
     policy = make_policy(cfg.policy, ds_meta=dataset.meta)
     policy.reset()
     device = get_safe_torch_device(policy.config.device)
     fps = cfg.fps if cfg.fps is not None else dataset.fps
 
-    # Connect robot AFTER loading dataset/policy (same pattern as record mode)
-    # to minimize idle time between connect and first hardware interaction.
-    robot.leader_arms = []
+    # Load Molmo model for EE prediction if checkpoint provided.
+    molmo_predictor = None
+    if cfg.molmo_checkpoint is not None:
+        molmo_predictor = MolmoEEPredictor(
+            checkpoint=str(cfg.molmo_checkpoint),
+            device=str(device),
+            num_ode_steps=cfg.molmo_num_ode_steps,
+        )
+        logging.info("Using Molmo model for EE position prediction")
+
+    # # Connect robot AFTER loading all models to minimize idle time.
     if not robot.is_connected:
         robot.connect()
 
@@ -574,11 +679,43 @@ def dataset_replay(
         frame = dataset[idx]
 
         batch = dict(robot_obs)
-        batch["left_ee_position"] = frame["left_ee_position"]
-        batch["right_ee_position"] = frame["right_ee_position"]
+
+        if molmo_predictor is not None and idx % 30 == 0:
+            # Predict EE positions from the live camera image using Molmo.
+            cam_img = robot_obs.get(cam_high_key)
+            if cam_img is None:
+                cam_img = next(v for k, v in robot_obs.items() if "image" in k)
+            img_np = cam_img.cpu().numpy() if isinstance(cam_img, torch.Tensor) else np.asarray(cam_img)
+            if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
+                img_np = np.transpose(img_np, (1, 2, 0))
+            if img_np.dtype in (np.float32, np.float64):
+                img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
+
+            trajectory_np = molmo_predictor.predict(
+                image=img_np,
+                instruction=cfg.molmo_instruction,
+                proprio_state=frame["observation.state"],
+            )
+            batch["left_ee_position"] = torch.from_numpy(trajectory_np[..., :3]).to(device)
+            batch["right_ee_position"] = torch.from_numpy(trajectory_np[..., 3:6]).to(device)
+        else:
+            batch["left_ee_position"] = frame["left_ee_position"]
+            batch["right_ee_position"] = frame["right_ee_position"]
 
         action = predict_action(batch, policy, device, policy.config.use_amp)
         robot.send_action(action)
+
+        # Resolve EE values for video overlay (use whichever source we used above).
+        if molmo_predictor is not None:
+            left_ee_for_vis = left_ee_np
+            right_ee_for_vis = right_ee_np
+        else:
+            left_ee_for_vis = frame["left_ee_position"]
+            right_ee_for_vis = frame["right_ee_position"]
+            if isinstance(left_ee_for_vis, torch.Tensor):
+                left_ee_for_vis = left_ee_for_vis.cpu().numpy()
+            if isinstance(right_ee_for_vis, torch.Tensor):
+                right_ee_for_vis = right_ee_for_vis.cpu().numpy()
 
         if record_video:
             for cam_key in robot_obs:
@@ -595,15 +732,8 @@ def dataset_replay(
                     if isinstance(cam_quat, torch.Tensor):
                         cam_quat = cam_quat.cpu().numpy()
 
-                    left_ee = frame["left_ee_position"]
-                    right_ee = frame["right_ee_position"]
-                    if isinstance(left_ee, torch.Tensor):
-                        left_ee = left_ee.cpu().numpy()
-                    if isinstance(right_ee, torch.Tensor):
-                        right_ee = right_ee.cpu().numpy()
-
                     img = _draw_ee_trajectory_on_image(
-                        img, cam_pos, cam_quat, left_ee, right_ee,
+                        img, cam_pos, cam_quat, left_ee_for_vis, right_ee_for_vis,
                     )
 
                 video_frames.setdefault(cam_key, []).append(img)

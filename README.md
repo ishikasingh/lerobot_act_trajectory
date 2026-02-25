@@ -52,6 +52,14 @@
 ---
 
 
+--- molmo trajectory prediction ---
+```bash
+python lerobot/scripts/control_robot.py --robot.type=trossen_ai_stationary --control.type=dataset_replay --control.repo_id=ishika/aloha_play_dataset_part_3_with_fk_full --control.episode=0 --control.policy.path=outputs/train/act_trossen_ai_stationary_30steps_traj/checkpoints/100000/pretrained_model --control.fps=30 --control.tags='["tutorial"]' --control.warmup_time_s=5 --control.episode_time_s=30 --control.reset_time_s=30 --control.num_episodes=10 --control.push_to_hub=true --control.num_image_writer_processes=1 --control.single_task="test" --control.root=aloha_play_dataset_part_3_with_fk_full --control.molmo_checkpoint=finetuned_model/ --control.molmo_instruction='stir the pot'
+```
+
+
+
+
 🤗 LeRobot aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry to robotics so that everyone can contribute and benefit from sharing datasets and pretrained models.
 
 🤗 LeRobot contains state-of-the-art approaches that have been shown to transfer to the real-world with a focus on imitation learning and reinforcement learning.

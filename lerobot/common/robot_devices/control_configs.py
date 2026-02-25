@@ -136,8 +136,23 @@ class DatasetReplayControlConfig(ControlConfig):
     fps: int | None = None
     # Directory to save rollout videos with EE trajectory overlay (None = no video).
     video_output_dir: str | Path | None = None
+    # Molmo model checkpoint for predicting EE positions (None = use dataset).
+    molmo_checkpoint: str | Path | None = None
+    # Language instruction for Molmo predictions.
+    molmo_instruction: str = ""
+    # Number of ODE integration steps for Molmo flow matching.
+    molmo_num_ode_steps: int = 10
     # Use vocal synthesis to read events.
     play_sounds: bool = True
+    # Fields shared with RecordControlConfig so the same config/CLI can be reused.
+    single_task: str = ""
+    warmup_time_s: int | float = 10
+    episode_time_s: int | float = 60
+    reset_time_s: int | float = 60
+    num_episodes: int = 50
+    push_to_hub: bool = False
+    num_image_writer_processes: int = 0
+    tags: list[str] | None = None
 
     def __post_init__(self):
         policy_path = parser.get_path_arg("control.policy")

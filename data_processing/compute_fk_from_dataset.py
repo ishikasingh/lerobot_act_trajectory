@@ -40,7 +40,7 @@ import torch
 from tqdm import tqdm
 import cv2
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D 
 
 try:
     import pinocchio as pin
@@ -464,7 +464,7 @@ def _default_package_root() -> Path:
 
 
 def main():
-    default_repo_id = "ykorkmaz/aloha_play_dataset_part_3"
+    default_repo_id = "LeeHakHo/play_dataset_feb22"
     default_urdf = "/root/lerobot/data_processing/stationary_ai.urdf" #str(_default_urdf_path())
     default_package_root = str(_default_package_root())
 
@@ -553,9 +553,9 @@ def main():
 
     dataset = LeRobotDataset(
         args.repo_id,
-        root=args.root,
+        root='/root/lerobot/play_dataset_feb22',
+        # root=args.root,
         episodes=args.episodes if args.episodes else None,
-        
     )
 
 
@@ -579,6 +579,60 @@ def main():
         "head_camera_position": {"dtype": "float32", "shape": [3], "description": "FK head camera position [m]"},
         "head_camera_quat_xyzw": {"dtype": "float32", "shape": [4], "description": "FK head camera quat [x,y,z,w]"},
     }
+
+
+
+    # INSERT_YOUR_CODE
+    # Add new columns to the HuggingFace dataset and push to the hub
+    import numpy as np
+
+    from datasets import Dataset, DatasetDict
+
+    # Load the dataset as a HuggingFace Dataset object
+    hf_ds = dataset.hf_dataset
+
+    # Add new columns (features) for FK results
+    # Collect each FK feature as a list for all rows
+    fk_left_ee_pos = [results[i]["left_ee_position"].astype(np.float32) for i in range(len(results))]
+    fk_left_ee_quat = [results[i]["left_ee_quat_xyzw"].astype(np.float32) for i in range(len(results))]
+    fk_right_ee_pos = [results[i]["right_ee_position"].astype(np.float32) for i in range(len(results))]
+    fk_right_ee_quat = [results[i]["right_ee_quat_xyzw"].astype(np.float32) for i in range(len(results))]
+    fk_head_cam_pos = [results[i]["head_camera_position"].astype(np.float32) for i in range(len(results))]
+    fk_head_cam_quat = [results[i]["head_camera_quat_xyzw"].astype(np.float32) for i in range(len(results))]
+
+    hf_ds = hf_ds.add_column("left_ee_position", fk_left_ee_pos)
+    hf_ds = hf_ds.add_column("left_ee_quat_xyzw", fk_left_ee_quat)
+    hf_ds = hf_ds.add_column("right_ee_position", fk_right_ee_pos)
+    hf_ds = hf_ds.add_column("right_ee_quat_xyzw", fk_right_ee_quat)
+    hf_ds = hf_ds.add_column("head_camera_position", fk_head_cam_pos)
+    hf_ds = hf_ds.add_column("head_camera_quat_xyzw", fk_head_cam_quat)
+
+    # Push the modified dataset to the hub
+    hf_ds.push_to_hub(output_repo_id)
+    # INSERT_YOUR_CODE
+    # Push the actual dataset directory contents (including videos) to the hub 
+    # so the hosted dataset on the hub has all video data, not just the metadata.
+
+    # Use LeRobotDataset's .push_to_hub() if available, or fallback to snapshot_upload directly.
+    # Assumes dataset.root contains all files including video directories.
+
+    try:
+        # If dataset has a .push_to_hub method (recommended)
+        dataset.push_to_hub(output_repo_id)
+    except AttributeError:
+        # Fallback: use huggingface_hub directly, uploading the local folder with videos and metadata
+        from huggingface_hub import HfApi
+        api = HfApi()
+        # Push the entire dataset directory, including videos
+        api.upload_folder(
+            repo_id=output_repo_id,
+            folder_path=str(dataset.root),
+            repo_type="dataset",
+            allow_patterns=["**/*"],  # upload everything (videos, images, JSON, parquet, etc)
+            commit_message="Push dataset with FK columns and all videos"
+        )
+
+
     features_with_fk = copy.deepcopy(dataset.meta.info["features"])
     for k, v in new_fk_features.items():
         v = copy.deepcopy(v)
@@ -589,6 +643,10 @@ def main():
     if os.path.exists(build_root):
         shutil.rmtree(build_root)
     print(f"Creating new dataset at {build_root} with add_frame/save_episode...")
+    
+
+    import ipdb; ipdb.set_trace()
+
     new_dataset = LeRobotDataset.create(
         repo_id=output_repo_id,
         fps=dataset.meta.fps,
