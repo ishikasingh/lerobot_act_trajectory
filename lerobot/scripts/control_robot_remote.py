@@ -12,140 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Utilities to control a robot.
+Remote-Molmo variant of control_robot.py.
 
-Useful to record a dataset, replay a recorded episode, run the policy on your robot
-and record an evaluation dataset, and to recalibrate your robot if needed.
+Identical to control_robot.py except that Molmo inference is offloaded to a
+remote server (molmo_server.py) via HTTP.  The robot-side machine does NOT
+need a GPU or the olmo/Molmo packages installed.
 
-Examples of usage:
+Pass the server URL through --control.molmo_checkpoint, e.g.:
 
-- Recalibrate your robot:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --control.type=calibrate
-```
+    python lerobot/scripts/control_robot_remote.py \\
+        --robot.type=trossen_ai_stationary \\
+        --control.type=dataset_replay \\
+        --control.repo_id=user/dataset \\
+        --control.episode=0 \\
+        --control.policy.path=outputs/train/act/checkpoints/080000/pretrained_model \\
+        --control.molmo_checkpoint=http://gpu-machine:5050 \\
+        --control.molmo_instruction="pick up the cup"
 
-- Unlimited teleoperation at highest frequency (~200 Hz is expected), to exit with CTRL+C:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --robot.cameras='{}' \
-    --control.type=teleoperate
+Start the server on the GPU machine first:
 
-# Add the cameras from the robot definition to visualize them:
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --control.type=teleoperate
-```
-
-- Unlimited teleoperation at a limited frequency of 30 Hz, to simulate data recording frequency:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --control.type=teleoperate \
-    --control.fps=30
-```
-
-- Record one episode in order to test replay:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --control.type=record \
-    --control.fps=30 \
-    --control.single_task="Grasp a lego block and put it in the bin." \
-    --control.repo_id=$USER/koch_test \
-    --control.num_episodes=1 \
-    --control.push_to_hub=True
-```
-
-- Visualize dataset:
-```bash
-python lerobot/scripts/visualize_dataset.py \
-    --repo-id $USER/koch_test \
-    --episode-index 0
-```
-
-- Replay this test episode:
-```bash
-python lerobot/scripts/control_robot.py replay \
-    --robot.type=so100 \
-    --control.type=replay \
-    --control.fps=30 \
-    --control.repo_id=$USER/koch_test \
-    --control.episode=0
-```
-
-- Dataset replay: run the policy conditioned on trajectory (left_ee_position, right_ee_position) from a dataset episode:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=trossen_ai_mobile \
-    --control.type=dataset_replay \
-    --control.repo_id=user/dataset_with_fk \
-    --control.episode=0 \
-    --control.policy.path=outputs/train/act_with_trajectory/checkpoints/080000/pretrained_model \
-    --control.fps=30
-```
-(The dataset must contain left_ee_position and right_ee_position; the policy must accept trajectory conditioning.)
-
-- Record a full dataset in order to train a policy, with 2 seconds of warmup,
-30 seconds of recording for each episode, and 10 seconds to reset the environment in between episodes:
-```bash
-python lerobot/scripts/control_robot.py record \
-    --robot.type=so100 \
-    --control.type=record \
-    --control.fps 30 \
-    --control.repo_id=$USER/koch_pick_place_lego \
-    --control.num_episodes=50 \
-    --control.warmup_time_s=2 \
-    --control.episode_time_s=30 \
-    --control.reset_time_s=10
-```
-
-- For remote controlled robots like LeKiwi, run this script on the robot edge device (e.g. RaspBerryPi):
-```bash
-python lerobot/scripts/control_robot.py \
-  --robot.type=lekiwi \
-  --control.type=remote_robot
-```
-
-**NOTE**: You can use your keyboard to control data recording flow.
-- Tap right arrow key '->' to early exit while recording an episode and go to resseting the environment.
-- Tap right arrow key '->' to early exit while resetting the environment and got to recording the next episode.
-- Tap left arrow key '<-' to early exit and re-record the current episode.
-- Tap escape key 'esc' to stop the data recording.
-This might require a sudo permission to allow your terminal to monitor keyboard events.
-
-**NOTE**: You can resume/continue data recording by running the same data recording command and adding `--control.resume=true`.
-
-- Train on this dataset with the ACT policy:
-```bash
-python lerobot/scripts/train.py \
-  --dataset.repo_id=${HF_USER}/koch_pick_place_lego \
-  --policy.type=act \
-  --output_dir=outputs/train/act_koch_pick_place_lego \
-  --job_name=act_koch_pick_place_lego \
-  --device=cuda \
-  --wandb.enable=true
-```
-
-- Run the pretrained policy on the robot:
-```bash
-python lerobot/scripts/control_robot.py \
-    --robot.type=so100 \
-    --control.type=record \
-    --control.fps=30 \
-    --control.single_task="Grasp a lego block and put it in the bin." \
-    --control.repo_id=$USER/eval_act_koch_pick_place_lego \
-    --control.num_episodes=10 \
-    --control.warmup_time_s=2 \
-    --control.episode_time_s=30 \
-    --control.reset_time_s=10 \
-    --control.push_to_hub=true \
-    --control.policy.path=outputs/train/act_koch_pick_place_lego/checkpoints/080000/pretrained_model
-```
+    python lerobot/scripts/molmo_server.py --checkpoint /path/to/molmo --port 5050
 """
 
+import base64
+import io
 import logging
 import time
 from dataclasses import asdict
@@ -154,9 +44,10 @@ from pprint import pformat
 
 import cv2
 import numpy as np
+import requests
 import torch
+from PIL import Image as PILImage
 
-# from safetensors.torch import load_file, save_file
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.robot_devices.control_configs import (
@@ -208,7 +99,6 @@ from data_processing.compute_fk_from_dataset import (
 
 @safe_disconnect
 def calibrate(robot: Robot, cfg: CalibrateControlConfig):
-    # TODO(aliberts): move this code in robots' classes
     if robot.robot_type.startswith("stretch"):
         if not robot.is_connected:
             robot.connect()
@@ -253,8 +143,6 @@ def calibrate(robot: Robot, cfg: CalibrateControlConfig):
         robot.calibrate_leader()
         return
 
-    # Calling `connect` automatically runs calibration
-    # when the calibration file is missing
     robot.connect()
     robot.disconnect()
     print("Calibration is done! You can now teleoperate and record datasets!")
@@ -276,8 +164,6 @@ def record(
     robot: Robot,
     cfg: RecordControlConfig,
 ) -> LeRobotDataset:
-    # TODO(rcadene): Add option to record logs
-
     if cfg.resume:
         dataset = LeRobotDataset(
             cfg.repo_id,
@@ -290,7 +176,6 @@ def record(
             )
         sanity_check_dataset_robot_compatibility(dataset, robot, cfg.fps, cfg.video)
     else:
-        # Create empty dataset or load existing saved episodes
         sanity_check_dataset_name(cfg.repo_id, cfg.policy)
         dataset = LeRobotDataset.create(
             cfg.repo_id,
@@ -302,11 +187,8 @@ def record(
             image_writer_threads=cfg.num_image_writer_threads_per_camera * len(robot.cameras),
         )
 
-    # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
 
-    # Disable the leader arms if a policy is provided,
-    # as they are not used during evaluation.
     if policy is not None:
         robot.leader_arms = []
 
@@ -315,10 +197,6 @@ def record(
 
     listener, events = init_keyboard_listener()
 
-    # Execute a few seconds without recording to:
-    # 1. teleoperate the robot to move it in starting position if no policy provided,
-    # 2. give times to the robot devices to connect and start synchronizing,
-    # 3. place the cameras windows on screen
     enable_teleoperation = policy is None
     log_say("Warmup record", cfg.play_sounds)
     warmup_record(robot, events, enable_teleoperation, cfg.warmup_time_s, cfg.display_cameras, cfg.fps)
@@ -347,10 +225,6 @@ def record(
                 single_task=cfg.single_task,
             )
 
-            # Execute a few seconds without recording to give time to manually reset the environment
-            # Current code logic doesn't allow to teleoperate during this time.
-            # TODO(rcadene): add an option to enable teleoperation during reset
-            # Skip reset for the last episode to be recorded
             if not events["stop_recording"] and (
                 (recorded_episodes < cfg.num_episodes - 1) or events["rerecord_episode"]
             ):
@@ -410,13 +284,9 @@ def replay(
     robot: Robot,
     cfg: ReplayControlConfig,
 ):
-    # TODO(rcadene, aliberts): refactor with control_loop, once `dataset` is an instance of LeRobotDataset
-    # TODO(rcadene): Add option to record logs
-
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root, episodes=[cfg.episode])
     actions = dataset.hf_dataset.select_columns("action")
 
-    # Disable leader arms as they are not used during replay
     robot.leader_arms = []
 
     if not robot.is_connected:
@@ -454,12 +324,7 @@ def _draw_ee_trajectory_on_image(
     left_ee: np.ndarray,
     right_ee: np.ndarray,
 ) -> np.ndarray:
-    """Draw projected EE trajectory points onto a BGR image.
-
-    left_ee / right_ee can be (3,) for a single point or (N, 3) for a trajectory chunk.
-    The first point in the chunk (current timestep) gets a large circle; subsequent
-    points are drawn as a fading polyline showing the future trajectory.
-    """
+    """Draw projected EE trajectory points onto a BGR image."""
     img = img.copy()
     cam_pos = np.asarray(cam_pos, dtype=np.float64).reshape(-1)[:3]
     cam_quat = np.asarray(cam_quat, dtype=np.float64).reshape(-1)[:4]
@@ -487,23 +352,20 @@ def _draw_ee_trajectory_on_image(
         valid = [(i, uv) for i, uv in enumerate(uvs) if uv is not None]
         if not valid:
             return
-        # Draw polyline for future trajectory.
         if len(valid) > 1:
             line_pts = np.array([uv for _, uv in valid], dtype=np.int32)
             cv2.polylines(img, [line_pts], isClosed=False, color=color_bgr, thickness=2)
-        # Current position: large filled circle.
         i0, uv0 = valid[0]
         cv2.circle(img, uv0, 10, color_bgr, -1)
         cv2.putText(img, label, (uv0[0] + 12, uv0[1] - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
-        # Future positions: small dots.
         for i, uv in valid[1:]:
             alpha = max(0.2, 1.0 - i / len(uvs))
             r = max(2, int(6 * alpha))
             cv2.circle(img, uv, r, color_bgr, -1)
 
-    draw_trajectory(left_uvs, (255, 0, 0), "L")   # blue in BGR
-    draw_trajectory(right_uvs, (0, 0, 255), "R")   # red in BGR
+    draw_trajectory(left_uvs, (255, 0, 0), "L")
+    draw_trajectory(right_uvs, (0, 0, 255), "R")
     return img
 
 
@@ -576,99 +438,62 @@ def _save_video_cv2(path: str, frames: list[np.ndarray], fps: int):
     logging.info(f"Wrote {len(frames)} frames to {path}")
 
 
-class MolmoEEPredictor:
-    """Predicts left/right EE positions using a Molmo VLA checkpoint.
+########################################################################################
+# Remote Molmo client (replaces local MolmoEEPredictor)
+########################################################################################
 
-    Wraps model loading, preprocessing, and flow-matching inference following
-    the pattern in eval_closed_loop.py.  Output is split into left_ee_position
-    (action_horizon, 3) and right_ee_position (action_horizon, 3).
+
+class RemoteMolmoClient:
+    """HTTP client that sends observations to molmo_server.py and receives EE predictions.
+
+    The server URL is passed via --control.molmo_checkpoint (e.g. http://gpu-machine:5050).
     """
 
-    def __init__(self, checkpoint: str, device: str = "cuda", num_ode_steps: int = 10):
-        from olmo.model import Molmo
-        from olmo.data import build_mm_preprocessor
+    def __init__(self, server_url: str, timeout: float = 60.0):
+        self.server_url = server_url.rstrip("/")
+        self.predict_url = f"{self.server_url}/predict"
+        self.timeout = timeout
+        self._check_health()
 
-        logging.info(f"Loading Molmo model from {checkpoint}")
-        self.model = Molmo.from_checkpoint(checkpoint, device=device)
-        self.model.eval()
-        self.preprocessor = build_mm_preprocessor(
-            self.model.config, for_inference=True, is_training=False
-        )
-        self.device = torch.device(device)
-        self.num_ode_steps = num_ode_steps
-        self.action_horizon = self.model.config.action_horizon
-        self.action_dim = self.model.config.action_dim
+    def _check_health(self):
+        try:
+            r = requests.get(f"{self.server_url}/health", timeout=5)
+            r.raise_for_status()
+            logging.info(f"Molmo server healthy at {self.server_url}")
+        except Exception as e:
+            logging.warning(f"Molmo server health check failed ({self.server_url}): {e}")
 
-    @torch.no_grad()
     def predict(
         self,
         image: np.ndarray,
         instruction: str,
         proprio_state: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run Molmo and return (left_ee, right_ee) each of shape (action_horizon, 3).
+        """Send image + proprio to server, return (left_ee, right_ee) numpy arrays."""
+        # JPEG-encode the RGB image
+        pil = PILImage.fromarray(image)
+        buf = io.BytesIO()
+        pil.save(buf, format="JPEG", quality=90)
+        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
-        Args:
-            image: RGB uint8 array (H, W, 3) from the head camera.
-            instruction: Language instruction / task description.
-            proprio_state: Optional proprioceptive state vector.
-
-        Returns:
-            (left_ee_position, right_ee_position) as float32 numpy arrays.
-        """
-        from PIL import Image as PILImage
-
-        pil_image = PILImage.fromarray(image)
-        example = {
-            "image": pil_image,
-            "prompt": instruction,
-            "style": "trajectory_3d_egodex_trossen_direct",
-            "proprio_state": proprio_state,
+        payload = {
+            "image_b64": image_b64,
+            "instruction": instruction,
+            "proprio_state": proprio_state.tolist() if proprio_state is not None else None,
         }
-        if proprio_state is not None:
-            example["state"] = proprio_state
 
-        batch = self.preprocessor(example)
+        resp = requests.post(self.predict_url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
 
-        input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(self.device)
-        images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(self.device)
-        image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(self.device)
-
-        image_masks = None
-        if "image_masks" in batch:
-            image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(self.device)
-        position_ids = None
-        if "position_ids" in batch:
-            position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(self.device)
-        proprio_tensor = None
-        if "proprio_state" in batch:
-            proprio_tensor = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(self.device)
-
-        expert_type = torch.tensor([1], dtype=torch.long).to(self.device)
-        initial_noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device)
-
-        actions = self.model.sample_actions_flow_matching(
-            input_ids=input_ids,
-            attention_mask=None,
-            images=images,
-            image_masks=image_masks,
-            image_input_idx=image_input_idx,
-            num_steps=self.num_ode_steps,
-            initial_noise=initial_noise,
-            position_ids=position_ids,
-            proprio_state=proprio_tensor,
-            expert_type=expert_type,
-        )
-
-        if isinstance(actions, tuple):
-            actions = actions[0]
-
-        actions_np = actions.cpu().numpy()[0]  # (action_horizon, action_dim)
-
-        # First 3 dims = left EE xyz, next 3 = right EE xyz.
-        left_ee = actions_np[:, :3].astype(np.float32)
-        right_ee = actions_np[:, 3:6].astype(np.float32)
+        left_ee = np.array(data["left_ee"], dtype=np.float32)
+        right_ee = np.array(data["right_ee"], dtype=np.float32)
         return left_ee, right_ee
+
+
+########################################################################################
+# dataset_replay (uses RemoteMolmoClient instead of MolmoEEPredictor)
+########################################################################################
 
 
 @safe_disconnect
@@ -676,18 +501,17 @@ def dataset_replay(
     robot: Robot,
     cfg: DatasetReplayControlConfig,
 ):
-    """Run the policy on the robot conditioned on trajectory (left_ee_position, right_ee_position) from a dataset episode.
+    """Run the policy conditioned on EE trajectory from a dataset episode.
 
-    Loads one episode from the LeRobot dataset (must have left_ee_position and right_ee_position).
-    At each step: get current robot observation, get trajectory chunk from dataset, run policy, execute action.
+    When --control.molmo_checkpoint is set to a URL (e.g. http://gpu:5050),
+    EE predictions are fetched from a remote molmo_server.py instance instead
+    of running Molmo locally.
     """
     if cfg.policy is None:
         raise ValueError(
             "dataset_replay requires a policy. Pass --control.policy.path=/path/to/checkpoint"
         )
 
-    # Load dataset and policy BEFORE connecting the robot so the base hardware
-    # doesn't time out while we download data / load model weights.
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
     dataset = LeRobotDataset(
@@ -701,7 +525,7 @@ def dataset_replay(
         if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
             raise ValueError(
                 "dataset_replay requires a dataset with left_ee_position and right_ee_position "
-                "(or --control.molmo_checkpoint to predict them). "
+                "(or --control.molmo_checkpoint=http://server:port to predict them remotely). "
                 f"Got features: {list(dataset.features.keys())}"
             )
 
@@ -710,8 +534,8 @@ def dataset_replay(
     device = get_safe_torch_device(policy.config.device)
     fps = cfg.fps if cfg.fps is not None else dataset.fps
 
-    # --------------- FK setup: compute EE positions from observation.state ---------------
-    urdf_path = "/root/lerobot/data_processing/stationary_ai.urdf"
+    # --------------- FK setup ---------------
+    urdf_path =  "data_processing/stationary_ai.urdf"
     fk_model = _load_urdf(urdf_path)
     fk_data = fk_model.createData()
 
@@ -723,28 +547,23 @@ def dataset_replay(
         for name in [LEFT_EE_LINK, RIGHT_EE_LINK, HEAD_CAMERA_LINK]
     }
 
-    def _state_to_ee(state_tensor: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-        """Run FK on an observation.state tensor and return (left_ee, right_ee) as float32 (3,)."""
+    def _state_to_ee(state_tensor):
         s = state_tensor.cpu().numpy() if isinstance(state_tensor, torch.Tensor) else np.asarray(state_tensor)
         s = np.asarray(s, dtype=np.float64).ravel()
         fk_out = compute_fk_for_frame(fk_model, fk_data, s, state_names, state_to_q, fk_frame_ids)
         return fk_out["left_ee_position"].astype(np.float32), fk_out["right_ee_position"].astype(np.float32)
 
-    # Load Molmo model for EE prediction if checkpoint provided.
-    molmo_predictor = None
+    # --------------- Remote Molmo client ---------------
+    molmo_client = None
     if cfg.molmo_checkpoint is not None:
-        molmo_predictor = MolmoEEPredictor(
-            checkpoint=str(cfg.molmo_checkpoint),
-            device=str(device),
-            num_ode_steps=cfg.molmo_num_ode_steps,
-        )
-        logging.info("Using Molmo model for EE position prediction")
+        server_url = str(cfg.molmo_checkpoint)
+        molmo_client = RemoteMolmoClient(server_url)
+        logging.info(f"Using remote Molmo server at {server_url}")
 
-    # # # Connect robot AFTER loading all models to minimize idle time.
+    # Connect robot AFTER loading all models to minimize idle time.
     # if not robot.is_connected:
     #     robot.connect()
 
-    # Video recording setup: collect annotated frames per camera.
     record_video = cfg.video_output_dir is not None
     video_frames: dict[str, list[np.ndarray]] = {}
     has_camera_pose = (
@@ -757,9 +576,6 @@ def dataset_replay(
     for idx in range(dataset.num_frames):
         start_t = time.perf_counter()
 
-        # if idx % 100 != 0:
-        #     continue
-
         frame = dataset[idx]
         if robot.is_connected:
             robot_obs = robot.capture_observation()
@@ -768,14 +584,13 @@ def dataset_replay(
                 "observation.state": frame["observation.state"],
                 "observation.images.cam_high": frame["observation.images.cam_high"].permute(1, 2, 0),
                 "observation.images.cam_low": frame["observation.images.cam_low"].permute(1, 2, 0),
-                'observation.images.cam_left_wrist': frame['observation.images.cam_left_wrist'].permute(1, 2, 0),
-                'observation.images.cam_right_wrist': frame['observation.images.cam_right_wrist'].permute(1, 2, 0),
+                "observation.images.cam_left_wrist": frame["observation.images.cam_left_wrist"].permute(1, 2, 0),
+                "observation.images.cam_right_wrist": frame["observation.images.cam_right_wrist"].permute(1, 2, 0),
             }
 
         batch = dict(robot_obs)
 
-        if molmo_predictor is not None and idx % 100 == 0:
-            # Predict EE positions from the live camera image using Molmo.
+        if molmo_client is not None and idx % 100 == 0:
             cam_img = robot_obs.get(cam_high_key)
             if cam_img is None:
                 cam_img = next(v for k, v in robot_obs.items() if "image" in k)
@@ -788,26 +603,21 @@ def dataset_replay(
             left_ee_curr, right_ee_curr = _state_to_ee(frame["observation.state"])
             proprio_state = np.concatenate([left_ee_curr, right_ee_curr])
 
-            
-
-            left_ee_np, right_ee_np = molmo_predictor.predict(
+            left_ee_np, right_ee_np = molmo_client.predict(
                 image=img_np,
                 instruction=cfg.molmo_instruction,
                 proprio_state=proprio_state,
             )
             left_ee_np = torch.from_numpy(left_ee_np).to(device)
             right_ee_np = torch.from_numpy(right_ee_np).to(device)
+
             def interp1d_torch(vec, target_len=100):
-                # vec: (N, C) e.g. (30, 3) -> treat as (1, C, N), interpolate to (1, C, target_len), -> (target_len, C)
                 return torch.nn.functional.interpolate(
-                    vec.T.unsqueeze(0).float(),  # (1, C, N)
+                    vec.T.unsqueeze(0).float(),
                     size=target_len,
                     mode='linear',
                     align_corners=True,
-                )[0].T  # (target_len, C)
-
-            left_ee_np = torch.cumsum(left_ee_np, dim=0) + torch.from_numpy(left_ee_curr).to(device)
-            right_ee_np = torch.cumsum(right_ee_np, dim=0) + torch.from_numpy(right_ee_curr).to(device)
+                )[0].T
 
             batch["left_ee_position"] = interp1d_torch(left_ee_np, 100)
             batch["right_ee_position"] = interp1d_torch(right_ee_np, 100)
@@ -815,18 +625,20 @@ def dataset_replay(
             if idx % 100 == 0:
                 fk_out = compute_fk_for_frame(
                     fk_model, fk_data,
-                    np.asarray(frame["observation.state"].cpu().numpy() if isinstance(frame["observation.state"], torch.Tensor) else frame["observation.state"], dtype=np.float64).ravel(),
+                    np.asarray(
+                        frame["observation.state"].cpu().numpy()
+                        if isinstance(frame["observation.state"], torch.Tensor)
+                        else frame["observation.state"],
+                        dtype=np.float64,
+                    ).ravel(),
                     state_names, state_to_q, fk_frame_ids,
                 )
                 cam_pos = fk_out["head_camera_position"]
                 cam_quat = fk_out["head_camera_quat_xyzw"]
 
-                # Molmo-predicted (interpolated) EE trajectory
                 left_vis = left_ee_np.cpu().numpy()
-                
                 right_vis = right_ee_np.cpu().numpy()
 
-                # Ground-truth EE trajectory from dataset
                 gt_left = frame["left_ee_position"]
                 gt_right = frame["right_ee_position"]
                 if isinstance(gt_left, torch.Tensor):
@@ -836,14 +648,12 @@ def dataset_replay(
 
                 vis_img = img_np.copy()
                 vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
-                # Draw Molmo predictions: blue (L) / red (R)
                 vis_img = _draw_ee_trajectory_on_image(vis_img, cam_pos, cam_quat, left_vis, right_vis)
-                # Draw ground-truth: green (L) / yellow (R)
-                # vis_img = _draw_ee_trajectory_on_image_colored(
-                #     vis_img, cam_pos, cam_quat, gt_left, gt_right,
-                #     left_color=(0, 255, 0), right_color=(0, 255, 255),
-                #     left_label="L_gt", right_label="R_gt",
-                # )
+                vis_img = _draw_ee_trajectory_on_image_colored(
+                    vis_img, cam_pos, cam_quat, gt_left, gt_right,
+                    left_color=(0, 255, 0), right_color=(0, 255, 255),
+                    left_label="L_gt", right_label="R_gt",
+                )
 
                 save_dir = Path(cfg.video_output_dir or "ee_debug_frames")
                 save_dir.mkdir(parents=True, exist_ok=True)
@@ -854,19 +664,12 @@ def dataset_replay(
             batch["left_ee_position"] = frame["left_ee_position"]
             batch["right_ee_position"] = frame["right_ee_position"]
 
-
-        # import ipdb; ipdb.set_trace()
-
         action = predict_action(batch, policy, device, policy.config.use_amp)
 
         if robot.is_connected:
             robot.send_action(action)
-        
 
-        
-
-        # Resolve EE values for video overlay (use whichever source we used above).
-        if molmo_predictor is not None:
+        if molmo_client is not None:
             left_ee_for_vis = left_ee_np
             right_ee_for_vis = right_ee_np
         else:
@@ -921,7 +724,6 @@ def control_robot(cfg: ControlPipelineConfig):
     logging.info(pformat(asdict(cfg)))
 
     robot = make_robot_from_config(cfg.robot)
-    
 
     if isinstance(cfg.control, CalibrateControlConfig):
         calibrate(robot, cfg.control)
@@ -939,8 +741,6 @@ def control_robot(cfg: ControlPipelineConfig):
         run_lekiwi(cfg.robot)
 
     if robot.is_connected:
-        # Disconnect manually to avoid a "Core dump" during process
-        # termination due to camera threads not properly exiting.
         robot.disconnect()
 
 

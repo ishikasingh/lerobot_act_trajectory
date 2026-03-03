@@ -105,6 +105,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
+
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):

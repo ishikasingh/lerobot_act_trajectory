@@ -121,10 +121,6 @@ def make_policy(
     # Before overwriting features from the dataset, check whether the pretrained
     # model was trained with trajectory conditioning. The pretrained config's
     # input_features (loaded from config.json) tells us what the model expects.
-    pretrained_has_trajectory = (
-        cfg.pretrained_path is not None and cfg.trajectory_feature is not None
-    )
-
     if ds_meta is not None:
         features = dataset_to_policy_features(ds_meta.features)
         kwargs["dataset_stats"] = ds_meta.stats
@@ -150,7 +146,7 @@ def make_policy(
         and use_trajectory
         and "left_ee_position" in cfg.input_features
         and "right_ee_position" in cfg.input_features
-        and (cfg.pretrained_path is None or pretrained_has_trajectory)
+        # and (cfg.pretrained_path is None or cfg.input_features.get('observation.trajectory') is not None)
     )
     if should_add_trajectory:
         chunk_size = getattr(cfg, "chunk_size", 100)
@@ -165,6 +161,7 @@ def make_policy(
         cfg.input_features.pop("right_ee_position", None)
 
     kwargs["config"] = cfg
+
 
     if cfg.pretrained_path:
         # Load a pretrained policy and override the config if needed (for example, if there are inference-time

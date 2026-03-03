@@ -168,7 +168,7 @@ class Normalize(nn.Module):
                 std = buffer["std"]
                 assert not torch.isinf(mean).any(), _no_stats_error_str("mean")
                 assert not torch.isinf(std).any(), _no_stats_error_str("std")
-                print("key", key, "mean", mean.shape, "std", std.shape, "batch[key]", batch[key].shape)
+                # print("key", key, "mean", mean.shape, "std", std.shape, "batch[key]", batch[key].shape)
                 batch[key] = (batch[key] - mean) / (std + 1e-8)
             elif norm_mode is NormalizationMode.MIN_MAX:
                 min = buffer["min"]

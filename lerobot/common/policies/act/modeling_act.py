@@ -494,6 +494,7 @@ class ACT(nn.Module):
             trajectory = torch.cat(
                 [batch["left_ee_position"], batch["right_ee_position"]], dim=-1
             )  # (B, chunk_size, 6)
+            # import ipdb; ipdb.set_trace()
             # Downsample trajectory to 30 steps from 100 steps
             # Assumes input shape (B, 100, 6): we want (B, 30, 6) by sampling uniformly.
             if trajectory.shape[1] == 100:

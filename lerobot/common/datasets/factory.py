@@ -134,9 +134,15 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
+    dataset_stats = LeRobotDataset(
+            "ishika/aloha_play_dataset_part_3_with_fk_full_split",
+            cfg.dataset.root.replace("aloha_play_dataset_part_3_with_fk_full_split", 
+                                            "aloha_play_dataset_part_3_with_fk_full")
+        )
     if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
+        for key in dataset_stats.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                # import ipdb; ipdb.set_trace()
+                dataset_stats.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     return dataset
