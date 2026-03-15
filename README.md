@@ -62,6 +62,9 @@ python lerobot/scripts/control_robot.py --robot.type=trossen_ai_stationary --con
 
 
  python lerobot/scripts/molmo_server.py --checkpoint ~/sky_workdir/FAR-affordance/molmo/finetuned_checkpoints_trossen_3d_traj_labelled_human_norm_100len/steps160000/ --use-pinggy
+
+ 2026-03-15 22:01:26,613 INFO Pinggy tunnel: https://gtrlc-3-133-43-206.a.free.pinggy.link
+
 #  --host 0.0.0.0 --port 5050 --device cuda
 
 
