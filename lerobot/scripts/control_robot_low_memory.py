@@ -12,18 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Remote-Molmo variant of control_robot.py.
+Low-memory variant of control_robot.py for dataset_replay with Molmo on smaller GPUs.
 
-Identical to control_robot.py except that Molmo inference is offloaded to a
-remote server. The robot-side machine does NOT need a GPU or the olmo/Molmo packages.
+Uses PyTorch memory optimizations to fit Molmo (~35GB fp32) on a 32GB GPU:
+- torch.autocast (bfloat16) for mixed-precision inference (reduces activation memory)
+- torch.inference_mode() (no gradient tracking)
+- torch.cuda.empty_cache() after loading
+- Fewer ODE steps (default 5 instead of 10) to reduce activation memory
 
-Use --control.molmo_checkpoint to point to the Molmo API server:
-- Same network:  http://gpu-machine:5050
-- Cross-network: Use Pinggy URL from molmo_server.py --use-pinggy (e.g. https://xxx.a0.pinggy.io)
+Note: Model weights stay fp32 to avoid dtype mismatch in ViT attention.
+
+Usage: same as control_robot.py, but run this script instead:
+    python lerobot/scripts/control_robot_low_memory.py \
+        --robot.type=trossen_ai_stationary \
+        --control.type=dataset_replay \
+        --control.repo_id=user/dataset_with_fk \
+        --control.episode=0 \
+        --control.policy.path=outputs/train/act/checkpoints/080000/pretrained_model \
+        --control.molmo_checkpoint=/path/to/molmo \
+        --control.molmo_num_ode_steps=5
 """
 
-import base64
-import io
 import json
 import logging
 import time
@@ -33,9 +42,7 @@ from pprint import pformat
 
 import cv2
 import numpy as np
-import requests
 import torch
-from PIL import Image as PILImage
 
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.common.policies.factory import make_policy
@@ -316,12 +323,7 @@ def _draw_ee_trajectory_on_image(
     left_ee: np.ndarray,
     right_ee: np.ndarray,
 ) -> np.ndarray:
-    """Draw projected EE trajectory points onto a BGR image.
-
-    left_ee / right_ee can be (3,) for a single point or (N, 3) for a trajectory chunk.
-    The first point in the chunk (current timestep) gets a large circle; subsequent
-    points are drawn as a fading polyline showing the future trajectory.
-    """
+    """Draw projected EE trajectory points onto a BGR image."""
     img = img.copy()
     cam_pos = np.asarray(cam_pos, dtype=np.float64).reshape(-1)[:3]
     cam_quat = np.asarray(cam_quat, dtype=np.float64).reshape(-1)[:4]
@@ -434,60 +436,99 @@ def _save_video_cv2(path: str, frames: list[np.ndarray], fps: int):
     logging.info(f"Wrote {len(frames)} frames to {path}")
 
 
-########################################################################################
-# Remote Molmo client (replaces local MolmoEEPredictor)
-########################################################################################
+class MolmoEEPredictorLowMemory:
+    """Molmo EE predictor with PyTorch memory optimizations for smaller GPUs (e.g. 32GB).
 
+    Uses autocast (bfloat16), inference_mode, and fewer ODE steps to reduce memory.
+    Model weights stay fp32 to avoid dtype mismatch in ViT attention.
+    """
 
-def _create_molmo_client(server_url: str, timeout: float = 60.0):
-    """Create Molmo client for the given server URL."""
-    return RemoteMolmoClient(server_url, timeout)
+    def __init__(self, checkpoint: str, device: str = "cuda", num_ode_steps: int = 5):
+        from olmo.model import Molmo
+        from olmo.data import build_mm_preprocessor
 
+        logging.info(f"Loading Molmo model from {checkpoint} (low-memory mode)")
+        self.model = Molmo.from_checkpoint(checkpoint, device=device)
+        self.model.eval()
 
-class RemoteMolmoClient:
-    """HTTP client that sends observations to Molmo server (same network)."""
+        # Use autocast for inference (avoids dtype mismatch in ViT attention).
+        # Model stays fp32; autocast runs eligible ops in bfloat16 to save activation memory.
+        self._dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
 
-    def __init__(self, server_url: str, timeout: float = 60.0):
-        self.server_url = server_url.rstrip("/")
-        self.predict_url = f"{self.server_url}/predict"
-        self.timeout = timeout
-        self._check_health()
+        self.preprocessor = build_mm_preprocessor(
+            self.model.config, for_inference=True, is_training=False
+        )
+        self.device = torch.device(device)
+        self.num_ode_steps = num_ode_steps
+        self.action_horizon = self.model.config.action_horizon
+        self.action_dim = self.model.config.action_dim
 
-    def _check_health(self):
-        try:
-            r = requests.get(f"{self.server_url}/health", timeout=5)
-            r.raise_for_status()
-            logging.info(f"Molmo server healthy at {self.server_url}")
-        except Exception as e:
-            logging.warning(f"Molmo server health check failed ({self.server_url}): {e}")
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logging.info(f"CUDA cache cleared. Model loaded: action_horizon={self.action_horizon}, action_dim={self.action_dim}")
 
+    @torch.inference_mode()
     def predict(
         self,
         image: np.ndarray,
         instruction: str,
         proprio_state: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Send image + proprio to server, return (T, 6) trajectory numpy array."""
-        pil = PILImage.fromarray(image)
-        buf = io.BytesIO()
-        pil.save(buf, format="JPEG", quality=90)
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        """Run Molmo and return (action_horizon, 6) trajectory array."""
+        from PIL import Image as PILImage
 
-        payload = {
-            "image_b64": image_b64,
-            "instruction": instruction,
-            "proprio_state": proprio_state.tolist() if proprio_state is not None else None,
+        pil_image = PILImage.fromarray(image)
+        example = {
+            "image": pil_image,
+            "prompt": instruction,
+            "style": "trajectory_3d_egodex_trossen_direct",
+            "proprio_state": proprio_state,
         }
+        if proprio_state is not None:
+            example["state"] = proprio_state
 
-        resp = requests.post(self.predict_url, json=payload, timeout=self.timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        return np.array(data["trajectory"], dtype=np.float32)
+        batch = self.preprocessor(example)
 
+        input_ids = torch.tensor(batch["input_tokens"], dtype=torch.long).unsqueeze(0).to(self.device)
+        images = torch.tensor(batch["images"], dtype=torch.float32).unsqueeze(0).to(self.device)
+        image_input_idx = torch.tensor(batch["image_input_idx"], dtype=torch.long).unsqueeze(0).to(self.device)
 
-########################################################################################
-# dataset_replay (uses RemoteMolmoClient instead of MolmoEEPredictor)
-########################################################################################
+        image_masks = None
+        if "image_masks" in batch:
+            image_masks = torch.tensor(batch["image_masks"]).unsqueeze(0).to(self.device)
+        position_ids = None
+        if "position_ids" in batch:
+            position_ids = torch.tensor(batch["position_ids"], dtype=torch.long).unsqueeze(0).to(self.device)
+        proprio_tensor = None
+        if "proprio_state" in batch:
+            proprio_tensor = torch.tensor(batch["proprio_state"], dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        expert_type = torch.tensor([1], dtype=torch.long).to(self.device)
+        initial_noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device, dtype=torch.float32)
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=self._dtype,
+            enabled=(self.device.type == "cuda" and self._dtype != torch.float32),
+        ):
+            actions = self.model.sample_actions_flow_matching(
+                input_ids=input_ids,
+                attention_mask=None,
+                images=images,
+                image_masks=image_masks,
+                image_input_idx=image_input_idx,
+                num_steps=self.num_ode_steps,
+                initial_noise=initial_noise,
+                position_ids=position_ids,
+                proprio_state=proprio_tensor,
+                expert_type=expert_type,
+            )
+
+        if isinstance(actions, tuple):
+            actions = actions[0]
+
+        actions_np = actions.float().cpu().numpy()[0]  # (action_horizon, action_dim)
+        return actions_np[:, :6].astype(np.float32)
 
 
 @safe_disconnect
@@ -495,12 +536,7 @@ def dataset_replay(
     robot: Robot,
     cfg: DatasetReplayControlConfig,
 ):
-    """Run the policy conditioned on EE trajectory from a dataset episode.
-
-    When --control.molmo_checkpoint is set to a URL (e.g. http://gpu:5050),
-    EE predictions are fetched from a remote molmo_server.py instance instead
-    of running Molmo locally.
-    """
+    """Run the policy on the robot conditioned on trajectory from a dataset episode."""
     if cfg.policy is None:
         raise ValueError(
             "dataset_replay requires a policy. Pass --control.policy.path=/path/to/checkpoint"
@@ -520,7 +556,7 @@ def dataset_replay(
         if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
             raise ValueError(
                 "dataset_replay requires a dataset with left_ee_position and right_ee_position "
-                "(or --control.molmo_checkpoint=http://server:port to predict them remotely). "
+                "(or --control.molmo_checkpoint to predict them). "
                 f"Got features: {list(dataset.features.keys())}"
             )
 
@@ -529,12 +565,11 @@ def dataset_replay(
     device = get_safe_torch_device(policy.config.device)
     fps = cfg.fps if cfg.fps is not None else dataset.fps
 
-    # --------------- FK setup ---------------
-    urdf_path = "data_processing/stationary_ai.urdf"
+    urdf_path = "/root/lerobot/data_processing/stationary_ai.urdf"
     fk_model = _load_urdf(urdf_path)
     fk_data = fk_model.createData()
 
-    stats_path = "aloha_play_dataset_part_3_with_fk_full/trajectory_stats.json"
+    stats_path = "/root/lerobot/aloha_play_dataset_part_3_with_fk_full/trajectory_stats.json"
     stats = json.load(open(stats_path))
     mean = torch.tensor(stats["trajectory_stats_mean"]).to(device)
     std = torch.tensor(stats["trajectory_stats_std"]).to(device)
@@ -547,7 +582,7 @@ def dataset_replay(
         for name in [LEFT_EE_LINK, RIGHT_EE_LINK, HEAD_CAMERA_LINK]
     }
 
-    def _state_to_ee(state_tensor):
+    def _state_to_ee(state_tensor: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
         s = state_tensor.cpu().numpy() if isinstance(state_tensor, torch.Tensor) else np.asarray(state_tensor)
         s = np.asarray(s, dtype=np.float64).ravel()
         fk_out = compute_fk_for_frame(fk_model, fk_data, s, state_names, state_to_q, fk_frame_ids)
@@ -571,15 +606,14 @@ def dataset_replay(
             align_corners=True,
         )[0].T
 
-    # --------------- Remote Molmo client ---------------
-    molmo_client = None
+    molmo_predictor = None
     if cfg.molmo_checkpoint is not None:
-        molmo_client = _create_molmo_client(str(cfg.molmo_checkpoint))
-        logging.info(f"Using remote Molmo at {cfg.molmo_checkpoint}")
-
-    # Connect robot AFTER loading all models to minimize idle time.
-    # if not robot.is_connected:
-    #     robot.connect()
+        molmo_predictor = MolmoEEPredictorLowMemory(
+            checkpoint=str(cfg.molmo_checkpoint),
+            device=str(device),
+            num_ode_steps=cfg.molmo_num_ode_steps,
+        )
+        logging.info("Using Molmo model for EE position prediction (low-memory mode)")
 
     record_video = cfg.video_output_dir is not None
     video_frames: dict[str, list[np.ndarray]] = {}
@@ -589,7 +623,6 @@ def dataset_replay(
     )
     cam_high_key = "observation.images.cam_high"
 
-    # log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
     for idx in range(episode_start, episode_end):
         start_t = time.perf_counter()
 
@@ -601,13 +634,13 @@ def dataset_replay(
                 "observation.state": frame["observation.state"],
                 "observation.images.cam_high": frame["observation.images.cam_high"].permute(1, 2, 0),
                 "observation.images.cam_low": frame["observation.images.cam_low"].permute(1, 2, 0),
-                "observation.images.cam_left_wrist": frame["observation.images.cam_left_wrist"].permute(1, 2, 0),
-                "observation.images.cam_right_wrist": frame["observation.images.cam_right_wrist"].permute(1, 2, 0),
+                'observation.images.cam_left_wrist': frame['observation.images.cam_left_wrist'].permute(1, 2, 0),
+                'observation.images.cam_right_wrist': frame['observation.images.cam_right_wrist'].permute(1, 2, 0),
             }
 
         batch = dict(robot_obs)
 
-        if molmo_client is not None and (idx % 50 == 0 or idx == episode_start):
+        if molmo_predictor is not None and (idx % 50 == 0 or idx == episode_start):
             cam_img = robot_obs.get(cam_high_key)
             if cam_img is None:
                 cam_img = next(v for k, v in robot_obs.items() if "image" in k)
@@ -628,18 +661,17 @@ def dataset_replay(
             task_idx = min(idx // frames_per_task, num_tasks - 1)
             task_instruction = TASKS[task_idx]
             print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
-
-            traj_np = molmo_client.predict(
+            traj_np = molmo_predictor.predict(
                 image=img_np,
                 instruction=task_instruction,
                 proprio_state=initial_ee,
             )
-            traj_flat = torch.from_numpy(traj_np).to(device)  # (T, 6)
+            traj_flat = torch.from_numpy(traj_np).to(device)
             initial_ee = torch.from_numpy(initial_ee).to(device)
 
             traj_flat = traj_flat * std + mean
             traj_flat = torch.cumsum(traj_flat, dim=0) + initial_ee.unsqueeze(0)
-            recovered = torch.cat([initial_ee.unsqueeze(0), traj_flat], dim=0)  # (T+1, 6)
+            recovered = torch.cat([initial_ee.unsqueeze(0), traj_flat], dim=0)
 
             batch["left_ee_position"] = _interp1d_torch(recovered[:, :3], 100)
             batch["right_ee_position"] = _interp1d_torch(recovered[:, 3:6], 100)
@@ -647,12 +679,7 @@ def dataset_replay(
             if idx % 50 == 0 or idx == episode_start:
                 fk_out = compute_fk_for_frame(
                     fk_model, fk_data,
-                    np.asarray(
-                        frame["observation.state"].cpu().numpy()
-                        if isinstance(frame["observation.state"], torch.Tensor)
-                        else frame["observation.state"],
-                        dtype=np.float64,
-                    ).ravel(),
+                    np.asarray(frame["observation.state"].cpu().numpy() if isinstance(frame["observation.state"], torch.Tensor) else frame["observation.state"], dtype=np.float64).ravel(),
                     state_names, state_to_q, fk_frame_ids,
                 )
                 cam_pos = fk_out["head_camera_position"]
@@ -724,11 +751,10 @@ def dataset_replay(
                         img, cam_pos, cam_quat, gt_left, gt_right,
                         left_label="L_gt", right_label="R_gt",
                     )
-                    if molmo_client is not None:
+                    if molmo_predictor is not None:
                         img = _draw_ee_trajectory_on_image(
                             img, cam_pos, cam_quat, left_vis, right_vis,
                         )
-
                 step_text = f"Step: {idx+1}/{episode_end - episode_start}: {task_instruction}"
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.7
@@ -737,7 +763,7 @@ def dataset_replay(
                 margin = 10
                 cv2.putText(
                     img, step_text, (margin, margin + 25), font, font_scale,
-                    font_color, thickness, lineType=cv2.LINE_AA,
+                    font_color, thickness, lineType=cv2.LINE_AA
                 )
                 video_frames.setdefault(cam_key, []).append(img)
 

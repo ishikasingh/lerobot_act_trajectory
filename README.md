@@ -61,7 +61,8 @@ python lerobot/scripts/control_robot.py --robot.type=trossen_ai_stationary --con
 
 
 
- python lerobot/scripts/molmo_server.py     --checkpoint ~/sky_workdir/FAR-affordance/molmo/finetuned_checkpoints_trossen_3d_traj_labelled_human_norm_100len/steps160000/     --host 0.0.0.0     --port 5050     --device cuda
+ python lerobot/scripts/molmo_server.py --checkpoint ~/sky_workdir/FAR-affordance/molmo/finetuned_checkpoints_trossen_3d_traj_labelled_human_norm_100len/steps160000/ --use-pinggy
+#  --host 0.0.0.0 --port 5050 --device cuda
 
 
 python lerobot/scripts/control_robot_remote.py --robot.type=trossen_ai_stationary --control.type=dataset_replay --control.repo_id=ishika/aloha_play_dataset_part_3_with_fk_full --control.episode=0 --control.policy.path=outputs/train/aact_trajectory_30steps/checkpoints/250000/pretrained_model --control.fps=30 --control.tags='["tutorial"]' --control.warmup_time_s=5 --control.episode_time_s=30 --control.reset_time_s=30 --control.num_episodes=10 --control.push_to_hub=true --control.num_image_writer_processes=1 --control.single_task="test" --control.root=aloha_play_dataset_part_3_with_fk_full --control.molmo_checkpoint=http://10.0.183.141:5050 --control.molmo_instruction='stir the pot' --control.video_output_dir=ee_debug_norm_train_human_run_160k_ep0_remote
