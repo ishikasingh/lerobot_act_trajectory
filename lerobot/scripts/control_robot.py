@@ -155,6 +155,7 @@ from pprint import pformat
 import cv2
 import numpy as np
 import torch
+import json
 
 # from safetensors.torch import load_file, save_file
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -189,6 +190,7 @@ from lerobot.configs import parser
 
 from data_processing.compute_fk_from_dataset import (
     _project_ee_to_image,
+    _project_cam_to_image,
     _load_urdf,
     _build_state_to_q_mapping,
     compute_fk_for_frame,
@@ -200,6 +202,8 @@ from data_processing.compute_fk_from_dataset import (
     DEFAULT_CX,
     DEFAULT_CY,
 )
+
+from split_episodes import TASKS
 
 ########################################################################################
 # Control modes
@@ -474,9 +478,8 @@ def _draw_ee_trajectory_on_image(
     right_pts = _ensure_2d(right_ee)
 
     def project_single(pt: np.ndarray) -> tuple[int, int] | None:
-        uv, _ = _project_ee_to_image(
-            cam_pos, cam_quat, pt, pt,
-            DEFAULT_FX, DEFAULT_FY, DEFAULT_CX, DEFAULT_CY,
+        uv = _project_cam_to_image(
+            pt, DEFAULT_FX, DEFAULT_FY, DEFAULT_CX, DEFAULT_CY,
         )
         return uv
 
@@ -493,7 +496,7 @@ def _draw_ee_trajectory_on_image(
             cv2.polylines(img, [line_pts], isClosed=False, color=color_bgr, thickness=2)
         # Current position: large filled circle.
         i0, uv0 = valid[0]
-        cv2.circle(img, uv0, 10, color_bgr, -1)
+        cv2.circle(img, uv0, 5, color_bgr, -1)
         cv2.putText(img, label, (uv0[0] + 12, uv0[1] - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
         # Future positions: small dots.
@@ -502,8 +505,8 @@ def _draw_ee_trajectory_on_image(
             r = max(2, int(6 * alpha))
             cv2.circle(img, uv, r, color_bgr, -1)
 
-    draw_trajectory(left_uvs, (255, 0, 0), "L")   # blue in BGR
-    draw_trajectory(right_uvs, (0, 0, 255), "R")   # red in BGR
+    draw_trajectory(left_uvs, (0, 255, 0), "L")   # light blue in BGR (almost cyan)
+    draw_trajectory(right_uvs, (0, 255, 255), "R")  # light red in BGR
     return img
 
 
@@ -513,8 +516,8 @@ def _draw_ee_trajectory_on_image_colored(
     cam_quat: np.ndarray,
     left_ee: np.ndarray,
     right_ee: np.ndarray,
-    left_color: tuple[int, int, int] = (0, 255, 0),
-    right_color: tuple[int, int, int] = (0, 255, 255),
+    left_color: tuple[int, int, int] = (255, 200, 100),
+    right_color: tuple[int, int, int] = (100, 100, 255),
     left_label: str = "L_gt",
     right_label: str = "R_gt",
 ) -> np.ndarray:
@@ -550,7 +553,7 @@ def _draw_ee_trajectory_on_image_colored(
             line_pts = np.array([uv for _, uv in valid], dtype=np.int32)
             cv2.polylines(img, [line_pts], isClosed=False, color=color_bgr, thickness=2)
         i0, uv0 = valid[0]
-        cv2.circle(img, uv0, 10, color_bgr, -1)
+        cv2.circle(img, uv0, 5, color_bgr, -1)
         cv2.putText(img, label, (uv0[0] + 12, uv0[1] - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
         for i, uv in valid[1:]:
@@ -647,6 +650,17 @@ class MolmoEEPredictor:
         expert_type = torch.tensor([1], dtype=torch.long).to(self.device)
         initial_noise = torch.randn(1, self.action_horizon, self.action_dim, device=self.device)
 
+        # actions = self.model.predict_actions_direct(
+        #             input_ids=input_ids,
+        #             attention_mask=None,
+        #             images=images,
+        #             image_masks=image_masks,
+        #             image_input_idx=image_input_idx,
+        #             position_ids=position_ids,
+        #             proprio_state=proprio_tensor,
+        #             expert_type=expert_type,
+        #         )
+
         actions = self.model.sample_actions_flow_matching(
             input_ids=input_ids,
             attention_mask=None,
@@ -659,16 +673,16 @@ class MolmoEEPredictor:
             proprio_state=proprio_tensor,
             expert_type=expert_type,
         )
-
         if isinstance(actions, tuple):
             actions = actions[0]
 
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, action_dim)
 
-        # First 3 dims = left EE xyz, next 3 = right EE xyz.
-        left_ee = actions_np[:, :3].astype(np.float32)
-        right_ee = actions_np[:, 3:6].astype(np.float32)
-        return left_ee, right_ee
+        # # First 3 dims = left EE xyz, next 3 = right EE xyz.
+        # left_ee = actions_np[:, :3].astype(np.float32)
+        # right_ee = actions_np[:, 3:6].astype(np.float32)
+        # return left_ee, right_ee
+        return actions_np
 
 
 @safe_disconnect
@@ -693,9 +707,10 @@ def dataset_replay(
     dataset = LeRobotDataset(
         cfg.repo_id,
         root=cfg.root,
-        episodes=[cfg.episode],
         delta_timestamps=delta_timestamps,
     )
+    episode_start = dataset.episode_data_index["from"][cfg.episode].item()
+    episode_end = dataset.episode_data_index["to"][cfg.episode].item()
 
     if cfg.molmo_checkpoint is None:
         if "left_ee_position" not in dataset.features or "right_ee_position" not in dataset.features:
@@ -715,6 +730,11 @@ def dataset_replay(
     fk_model = _load_urdf(urdf_path)
     fk_data = fk_model.createData()
 
+    stats_path = "/root/lerobot/aloha_play_dataset_part_3_with_fk_full/trajectory_stats.json"
+    stats = json.load(open(stats_path))
+    mean = torch.tensor(stats["trajectory_stats_mean"]).to(device)
+    std = torch.tensor(stats["trajectory_stats_std"]).to(device)
+
     state_key = "observation.state"
     state_names = dataset.features[state_key].get("names")
     state_to_q = _build_state_to_q_mapping(fk_model, state_names)
@@ -728,7 +748,28 @@ def dataset_replay(
         s = state_tensor.cpu().numpy() if isinstance(state_tensor, torch.Tensor) else np.asarray(state_tensor)
         s = np.asarray(s, dtype=np.float64).ravel()
         fk_out = compute_fk_for_frame(fk_model, fk_data, s, state_names, state_to_q, fk_frame_ids)
+        
         return fk_out["left_ee_position"].astype(np.float32), fk_out["right_ee_position"].astype(np.float32)
+
+    def _world_to_camera(
+        p_world: np.ndarray,
+        cam_position: np.ndarray,
+        cam_quat_xyzw: np.ndarray,
+    ) -> np.ndarray:
+        """Transform world-frame point to camera frame. p_world (3,), returns (3,)."""
+        from scipy.spatial.transform import Rotation
+        R_world_to_cam = Rotation.from_quat(cam_quat_xyzw).as_matrix().T
+        p_cam = R_world_to_cam @ (np.asarray(p_world).reshape(3) - np.asarray(cam_position).reshape(3))
+        return p_cam
+
+    def _interp1d_torch(vec, target_len=100):
+        # vec: (N, C) e.g. (30, 3) -> treat as (1, C, N), interpolate to (1, C, target_len), -> (target_len, C)
+        return torch.nn.functional.interpolate(
+            vec.T.unsqueeze(0).float(),  # (1, C, N)
+            size=target_len,
+            mode='linear',
+            align_corners=True,
+        )[0].T  # (target_len, C)
 
     # Load Molmo model for EE prediction if checkpoint provided.
     molmo_predictor = None
@@ -754,7 +795,7 @@ def dataset_replay(
     cam_high_key = "observation.images.cam_high"
 
     # log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
-    for idx in range(dataset.num_frames):
+    for idx in range(episode_start, episode_end):
         start_t = time.perf_counter()
 
         # if idx % 100 != 0:
@@ -774,7 +815,7 @@ def dataset_replay(
 
         batch = dict(robot_obs)
 
-        if molmo_predictor is not None and idx % 100 == 0:
+        if molmo_predictor is not None and (idx % 50 == 0 or idx == episode_start):
             # Predict EE positions from the live camera image using Molmo.
             cam_img = robot_obs.get(cam_high_key)
             if cam_img is None:
@@ -786,33 +827,38 @@ def dataset_replay(
                 img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
 
             left_ee_curr, right_ee_curr = _state_to_ee(frame["observation.state"])
-            proprio_state = np.concatenate([left_ee_curr, right_ee_curr])
-
+            # import ipdb; ipdb.set_trace()
+            left_ee_curr = _world_to_camera(left_ee_curr, frame["head_camera_position"], frame["head_camera_quat_xyzw"])
+            right_ee_curr = _world_to_camera(right_ee_curr, frame["head_camera_position"], frame["head_camera_quat_xyzw"])
             
+            initial_ee = np.concatenate([left_ee_curr, right_ee_curr])
 
-            left_ee_np, right_ee_np = molmo_predictor.predict(
+            # left_ee_curr = torch.from_numpy(left_ee_curr).to(device)
+            # right_ee_curr = torch.from_numpy(right_ee_curr).to(device)
+
+            # Assign task instructions uniformly as idx increases through total frames
+            num_tasks = len(TASKS)
+            # Uniform split: assign first N/num_tasks frames to task 0, next N/num_tasks to task 1, etc.
+            frames_per_task = (episode_end - episode_start) // num_tasks
+            task_idx = min(idx // frames_per_task, num_tasks - 1)  # Ensure doesn't go out of range for last task
+            task_instruction = TASKS[task_idx]
+            print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
+            traj_np = molmo_predictor.predict(
                 image=img_np,
-                instruction=cfg.molmo_instruction,
-                proprio_state=proprio_state,
+                instruction=task_instruction,
+                proprio_state=initial_ee,
             )
-            left_ee_np = torch.from_numpy(left_ee_np).to(device)
-            right_ee_np = torch.from_numpy(right_ee_np).to(device)
-            def interp1d_torch(vec, target_len=100):
-                # vec: (N, C) e.g. (30, 3) -> treat as (1, C, N), interpolate to (1, C, target_len), -> (target_len, C)
-                return torch.nn.functional.interpolate(
-                    vec.T.unsqueeze(0).float(),  # (1, C, N)
-                    size=target_len,
-                    mode='linear',
-                    align_corners=True,
-                )[0].T  # (target_len, C)
+            traj_flat = torch.from_numpy(traj_np).to(device)  # (T, 6)
+            initial_ee = torch.from_numpy(initial_ee).to(device)
 
-            left_ee_np = torch.cumsum(left_ee_np, dim=0) + torch.from_numpy(left_ee_curr).to(device)
-            right_ee_np = torch.cumsum(right_ee_np, dim=0) + torch.from_numpy(right_ee_curr).to(device)
+            traj_flat = traj_flat * std + mean
+            traj_flat = torch.cumsum(traj_flat, dim=0) + initial_ee.unsqueeze(0)
+            recovered = torch.cat([initial_ee.unsqueeze(0), traj_flat], dim=0)  # (T+1, 6)
 
-            batch["left_ee_position"] = interp1d_torch(left_ee_np, 100)
-            batch["right_ee_position"] = interp1d_torch(right_ee_np, 100)
+            batch["left_ee_position"] = _interp1d_torch(recovered[:, :3], 100)
+            batch["right_ee_position"] = _interp1d_torch(recovered[:, 3:6], 100)
 
-            if idx % 100 == 0:
+            if idx % 50 == 0 or idx == episode_start:
                 fk_out = compute_fk_for_frame(
                     fk_model, fk_data,
                     np.asarray(frame["observation.state"].cpu().numpy() if isinstance(frame["observation.state"], torch.Tensor) else frame["observation.state"], dtype=np.float64).ravel(),
@@ -822,9 +868,9 @@ def dataset_replay(
                 cam_quat = fk_out["head_camera_quat_xyzw"]
 
                 # Molmo-predicted (interpolated) EE trajectory
-                left_vis = left_ee_np.cpu().numpy()
+                left_vis = recovered[:, :3].cpu().numpy()
                 
-                right_vis = right_ee_np.cpu().numpy()
+                right_vis = recovered[:, 3:6].cpu().numpy()
 
                 # Ground-truth EE trajectory from dataset
                 gt_left = frame["left_ee_position"]
@@ -835,15 +881,47 @@ def dataset_replay(
                     gt_right = gt_right.cpu().numpy()
 
                 vis_img = img_np.copy()
+
                 vis_img = cv2.cvtColor(vis_img, cv2.COLOR_RGB2BGR)
+                # Write task_instruction string text onto vis_img (cv2 image) at the top left starting from (10, 30).
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                font_thickness = 2
+                text_color = (255, 255, 255)  # white
+                outline_color = (0, 0, 0)    # black for contrast
+                x, y = 10, 30  # Top-left starting coordinates for text baseline
+
+                # To make the text more readable, first draw the text outline (thicker, black)
+                cv2.putText(
+                    vis_img,
+                    f"{task_instruction}",
+                    (x, y),
+                    font,
+                    font_scale,
+                    outline_color,
+                    font_thickness + 2,
+                    lineType=cv2.LINE_AA
+                )
+                # Draw the actual text (white)
+                cv2.putText(
+                    vis_img,
+                    f"{task_instruction}",
+                    (x, y),
+                    font,
+                    font_scale,
+                    text_color,
+                    font_thickness,
+                    lineType=cv2.LINE_AA
+                )
+                
+                # Draw ground-truth: green (L) / yellow (R)
+                vis_img = _draw_ee_trajectory_on_image_colored(
+                    vis_img, cam_pos, cam_quat, gt_left, gt_right,
+                    # left_color=(0, 255, 0), right_color=(0, 255, 255),
+                    left_label="L_gt", right_label="R_gt",
+                )
                 # Draw Molmo predictions: blue (L) / red (R)
                 vis_img = _draw_ee_trajectory_on_image(vis_img, cam_pos, cam_quat, left_vis, right_vis)
-                # Draw ground-truth: green (L) / yellow (R)
-                # vis_img = _draw_ee_trajectory_on_image_colored(
-                #     vis_img, cam_pos, cam_quat, gt_left, gt_right,
-                #     left_color=(0, 255, 0), right_color=(0, 255, 255),
-                #     left_label="L_gt", right_label="R_gt",
-                # )
 
                 save_dir = Path(cfg.video_output_dir or "ee_debug_frames")
                 save_dir.mkdir(parents=True, exist_ok=True)
@@ -863,20 +941,18 @@ def dataset_replay(
             robot.send_action(action)
         
 
-        
-
-        # Resolve EE values for video overlay (use whichever source we used above).
-        if molmo_predictor is not None:
-            left_ee_for_vis = left_ee_np
-            right_ee_for_vis = right_ee_np
-        else:
-            left_ee_for_vis = frame["left_ee_position"]
-            right_ee_for_vis = frame["right_ee_position"]
+        # # Resolve EE values for video overlay (use whichever source we used above).
+        # if molmo_predictor is not None and idx % 100 == 0:
+        #     left_ee_for_vis = recovered[:, :3].cpu().numpy()
+        #     right_ee_for_vis = recovered[:, 3:6].cpu().numpy()
+        # else:
+        #     left_ee_for_vis = frame["left_ee_position"]
+        #     right_ee_for_vis = frame["right_ee_position"]
             
-        if isinstance(left_ee_for_vis, torch.Tensor):
-            left_ee_for_vis = left_ee_for_vis.cpu().numpy()
-        if isinstance(right_ee_for_vis, torch.Tensor):
-            right_ee_for_vis = right_ee_for_vis.cpu().numpy()
+        # if isinstance(left_ee_for_vis, torch.Tensor):
+        #     left_ee_for_vis = left_ee_for_vis.cpu().numpy()
+        # if isinstance(right_ee_for_vis, torch.Tensor):
+        #     right_ee_for_vis = right_ee_for_vis.cpu().numpy()
 
         if record_video:
             for cam_key in robot_obs:
@@ -892,11 +968,33 @@ def dataset_replay(
                         cam_pos = cam_pos.cpu().numpy()
                     if isinstance(cam_quat, torch.Tensor):
                         cam_quat = cam_quat.cpu().numpy()
-
-                    img = _draw_ee_trajectory_on_image(
-                        img, cam_pos, cam_quat, left_ee_for_vis, right_ee_for_vis,
+                    img = _draw_ee_trajectory_on_image_colored(
+                        img, cam_pos, cam_quat, gt_left, gt_right,
+                        # left_color=(0, 255, 0), right_color=(0, 255, 255),
+                        left_label="L_gt", right_label="R_gt",
                     )
-
+                    if molmo_predictor is not None:
+                        img = _draw_ee_trajectory_on_image(
+                            img, cam_pos, cam_quat, left_vis, right_vis,
+                        )
+                # Add text overlay displaying the current step on the video frame
+                step_text = f"Step: {idx+1}/{episode_end - episode_start}: {task_instruction}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.7
+                font_color = (255, 255, 255)
+                thickness = 2
+                margin = 10
+                # Put the text at the top-left corner of the image
+                cv2.putText(
+                    img,
+                    step_text,
+                    (margin, margin + 25),
+                    font,
+                    font_scale,
+                    font_color,
+                    thickness,
+                    lineType=cv2.LINE_AA
+                )
                 video_frames.setdefault(cam_key, []).append(img)
 
         dt_s = time.perf_counter() - start_t

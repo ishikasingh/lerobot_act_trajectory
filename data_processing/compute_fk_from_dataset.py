@@ -286,6 +286,22 @@ DEFAULT_CY = 245.318
 # cy = 245.318
 
 
+def _project_cam_to_image(
+    p_cam: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> tuple[int, int] | None:
+    """Pinhole projection from camera-frame 3D point to pixel coords. Returns None if behind camera."""
+    p_cam = np.asarray(p_cam).reshape(3)
+    if p_cam[2] <= 1e-6:
+        return None
+    u = fx * p_cam[0] / p_cam[2] + cx
+    v = fy * p_cam[1] / p_cam[2] + cy
+    return (int(round(u)), int(round(v)))
+
+
 def _project_ee_to_image(
     cam_position: np.ndarray,
     cam_quat_xyzw: np.ndarray,
@@ -304,17 +320,11 @@ def _project_ee_to_image(
     R_world_cam = Rotation.from_quat(cam_quat_xyzw).as_matrix()
     t_cam = np.asarray(cam_position).reshape(3)
 
-    def project(p_world: np.ndarray) -> tuple[int, int] | None:
-        p_world = np.asarray(p_world).reshape(3)
-        p_cam = R_world_cam.T @ (p_world - t_cam)
-        if p_cam[2] <= 1e-6:
-            return None
-        u = fx * p_cam[0] / p_cam[2] + cx
-        v = fy * p_cam[1] / p_cam[2] + cy
-        return (int(round(u)), int(round(v)))
+    def to_cam(p_world: np.ndarray) -> np.ndarray:
+        return R_world_cam.T @ (np.asarray(p_world).reshape(3) - t_cam)
 
-    left_uv = project(left_ee_world)
-    right_uv = project(right_ee_world)
+    left_uv = _project_cam_to_image(to_cam(left_ee_world), fx, fy, cx, cy)
+    right_uv = _project_cam_to_image(to_cam(right_ee_world), fx, fy, cx, cy)
     return left_uv, right_uv
 
 

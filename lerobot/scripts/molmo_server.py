@@ -19,8 +19,7 @@ The server exposes a single POST endpoint:
             instruction:    language instruction string
             proprio_state:  list of floats (optional, e.g. 6-d EE positions)
         Response (JSON):
-            left_ee:   list[list[float]]  (action_horizon x 3)
-            right_ee:  list[list[float]]  (action_horizon x 3)
+            trajectory:  list[list[float]]  (action_horizon x 6)
 """
 
 import argparse
@@ -67,7 +66,7 @@ class MolmoPredictor:
         image: np.ndarray,
         instruction: str,
         proprio_state: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         pil_image = Image.fromarray(image)
         example = {
             "image": pil_image,
@@ -114,9 +113,7 @@ class MolmoPredictor:
             actions = actions[0]
 
         actions_np = actions.cpu().numpy()[0]  # (action_horizon, action_dim)
-        left_ee = actions_np[:, :3].astype(np.float32)
-        right_ee = actions_np[:, 3:6].astype(np.float32)
-        return left_ee, right_ee
+        return actions_np[:, :6].astype(np.float32)
 
 
 @app.route("/predict", methods=["POST"])
@@ -132,14 +129,13 @@ def handle_predict():
     proprio_raw = data.get("proprio_state")
     proprio_state = np.array(proprio_raw, dtype=np.float32) if proprio_raw is not None else None
 
-    left_ee, right_ee = _predictor.predict(image, instruction, proprio_state)
+    trajectory = _predictor.predict(image, instruction, proprio_state)
 
     elapsed = time.time() - t0
     logging.info(f"/predict  {image.shape}  dt={elapsed:.3f}s")
 
     return jsonify({
-        "left_ee": left_ee.tolist(),
-        "right_ee": right_ee.tolist(),
+        "trajectory": trajectory.tolist(),
     })
 
 

@@ -47,10 +47,10 @@ logger = logging.getLogger(__name__)
 
 TASKS = [
     "Stir the pot",
-    "Unzip the pencil case",
     "Uncap the red marker",
-    "Open the red drawer",
+    "Unzip the pencil case",
     "Uncap the bottle",
+    "Open the red drawer",
 ]
 
 TASK_TO_INDEX = {t: i for i, t in enumerate(TASKS)}
