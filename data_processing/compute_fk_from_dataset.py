@@ -563,10 +563,22 @@ def main():
 
     dataset = LeRobotDataset(
         args.repo_id,
-        root='/root/lerobot/play_dataset_feb22',
-        # root=args.root,
+        # root='/root/lerobot/play_dataset_feb22',
+        root=args.root,
         episodes=args.episodes if args.episodes else None,
     )
+    output_repo_id = "ishika/aloha_play_dataset_feb22_with_fk"
+
+    from huggingface_hub import HfApi
+    # api = HfApi()
+    # # Push the entire dataset directory, including videos
+    # api.upload_folder(
+    #     repo_id=output_repo_id,
+    #     folder_path=str(dataset.root),
+    #     repo_type="dataset",
+    #     allow_patterns=["**/*"],  # upload everything (videos, images, JSON, parquet, etc)
+    #     commit_message="Push dataset with FK columns and all videos"
+    # )
 
 
     print(f"Loaded dataset: {dataset.num_frames} frames, {dataset.num_episodes} episodes.")
@@ -580,7 +592,7 @@ def main():
     )
 
     # Create a new dataset from scratch with add_frame / save_episode, then push to hub.
-    output_repo_id = "ishika/aloha_play_dataset_part_3_with_fk_final"
+    
     new_fk_features = {
         "left_ee_position": {"dtype": "float32", "shape": [3], "description": "FK left EE position [m]"},
         "left_ee_quat_xyzw": {"dtype": "float32", "shape": [4], "description": "FK left EE quat [x,y,z,w]"},
@@ -617,6 +629,51 @@ def main():
     hf_ds = hf_ds.add_column("head_camera_position", fk_head_cam_pos)
     hf_ds = hf_ds.add_column("head_camera_quat_xyzw", fk_head_cam_quat)
 
+    # Update episode stats with the new FK columns
+    from lerobot.common.datasets.compute_stats import aggregate_stats, compute_episode_stats
+    from lerobot.common.datasets.utils import (
+        EPISODES_STATS_PATH,
+        load_episodes_stats,
+        load_info,
+        write_all_episodes_stats,
+        write_info,
+        write_stats,
+    )
+
+    ep_from = dataset.episode_data_index["from"]
+    ep_to = dataset.episode_data_index["to"]
+    new_fk_features_for_stats = {k: {**v, "shape": tuple(v["shape"])} for k, v in new_fk_features.items()}
+
+    existing_stats = {}
+    if (dataset.root / EPISODES_STATS_PATH).exists():
+        existing_stats = load_episodes_stats(dataset.root)
+
+    for ep_idx in tqdm(range(dataset.num_episodes), desc="Computing episode stats"):
+        from_idx = int(ep_from[ep_idx].item())
+        to_idx = int(ep_to[ep_idx].item())
+        ep_data = {
+            "left_ee_position": np.stack([results[i]["left_ee_position"] for i in range(from_idx, to_idx)]),
+            "left_ee_quat_xyzw": np.stack([results[i]["left_ee_quat_xyzw"] for i in range(from_idx, to_idx)]),
+            "right_ee_position": np.stack([results[i]["right_ee_position"] for i in range(from_idx, to_idx)]),
+            "right_ee_quat_xyzw": np.stack([results[i]["right_ee_quat_xyzw"] for i in range(from_idx, to_idx)]),
+            "head_camera_position": np.stack([results[i]["head_camera_position"] for i in range(from_idx, to_idx)]),
+            "head_camera_quat_xyzw": np.stack([results[i]["head_camera_quat_xyzw"] for i in range(from_idx, to_idx)]),
+        }
+        fk_stats = compute_episode_stats(ep_data, new_fk_features_for_stats)
+        merged = {**existing_stats.get(ep_idx, {}), **fk_stats}
+        existing_stats[ep_idx] = merged
+
+    write_all_episodes_stats(existing_stats, dataset.root)
+
+    # Update meta/info.json with new features and stats.json with aggregated stats
+    info = load_info(dataset.root)
+    for k, v in new_fk_features.items():
+        info["features"][k] = {**v, "shape": list(v["shape"])}
+    write_info(info, dataset.root)
+
+    agg_stats = aggregate_stats(list(existing_stats.values()))
+    write_stats(agg_stats, dataset.root)
+
     # Push the modified dataset to the hub
     hf_ds.push_to_hub(output_repo_id)
     # INSERT_YOUR_CODE
@@ -626,21 +683,21 @@ def main():
     # Use LeRobotDataset's .push_to_hub() if available, or fallback to snapshot_upload directly.
     # Assumes dataset.root contains all files including video directories.
 
-    try:
-        # If dataset has a .push_to_hub method (recommended)
-        dataset.push_to_hub(output_repo_id)
-    except AttributeError:
-        # Fallback: use huggingface_hub directly, uploading the local folder with videos and metadata
-        from huggingface_hub import HfApi
-        api = HfApi()
-        # Push the entire dataset directory, including videos
-        api.upload_folder(
-            repo_id=output_repo_id,
-            folder_path=str(dataset.root),
-            repo_type="dataset",
-            allow_patterns=["**/*"],  # upload everything (videos, images, JSON, parquet, etc)
-            commit_message="Push dataset with FK columns and all videos"
-        )
+    # try:
+    #     # If dataset has a .push_to_hub method (recommended)
+    #     dataset.push_to_hub(output_repo_id)
+    # except AttributeError:
+    #     # Fallback: use huggingface_hub directly, uploading the local folder with videos and metadata
+    #     from huggingface_hub import HfApi
+    api = HfApi()
+    # Push the entire dataset directory, including videos
+    api.upload_folder(
+        repo_id=output_repo_id,
+        folder_path=str(dataset.root),
+        repo_type="dataset",
+        allow_patterns=["**/*"],  # upload everything (videos, images, JSON, parquet, etc)
+        commit_message="Push dataset with FK columns and all videos"
+    )
 
 
     features_with_fk = copy.deepcopy(dataset.meta.info["features"])

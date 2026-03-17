@@ -230,6 +230,18 @@ def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path
     append_jsonlines(episode_stats, local_dir / EPISODES_STATS_PATH)
 
 
+def write_all_episodes_stats(episodes_stats: dict[int, dict], local_dir: Path) -> None:
+    """Write the full episodes_stats dict to meta/episodes_stats.jsonl (overwrites)."""
+    local_dir = Path(local_dir)
+    (local_dir / EPISODES_STATS_PATH).parent.mkdir(exist_ok=True, parents=True)
+    records = [
+        {"episode_index": ep_idx, "stats": serialize_dict(stats)}
+        for ep_idx, stats in sorted(episodes_stats.items())
+    ]
+    with jsonlines.open(local_dir / EPISODES_STATS_PATH, "w") as writer:
+        writer.write_all(records)
+
+
 def load_episodes_stats(local_dir: Path) -> dict:
     episodes_stats = load_jsonlines(local_dir / EPISODES_STATS_PATH)
     return {

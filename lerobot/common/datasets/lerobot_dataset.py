@@ -546,14 +546,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
 
+        # import ipdb; ipdb.set_trace()
         # Load actual data
         try:
             if force_cache_sync:
                 raise FileNotFoundError
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
+            
+            # assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
             self.hf_dataset = self.load_hf_dataset()
         except (AssertionError, FileNotFoundError, NotADirectoryError):
+
             self.revision = get_safe_version(self.repo_id, self.revision)
+
             self.download_episodes(download_videos)
             self.hf_dataset = self.load_hf_dataset()
 
@@ -718,8 +722,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             return get_hf_features_from_features(self.features)
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
-        ep_start = self.episode_data_index["from"][ep_idx]
-        ep_end = self.episode_data_index["to"][ep_idx]
+        # import ipdb; ipdb.set_trace()
+        query_ep_idx = list(self.meta.episodes.keys()).index(ep_idx)
+
+        ep_start = self.episode_data_index["from"][query_ep_idx]
+        ep_end = self.episode_data_index["to"][query_ep_idx]
         query_indices = {
             key: [max(ep_start.item(), min(ep_end.item() - 1, idx + delta)) for delta in delta_idx]
             for key, delta_idx in self.delta_indices.items()
@@ -779,6 +786,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx) -> dict:
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
+        
+        # if ep_idx >= 1000:
+        #     query_ep_idx = ep_idx % 1000 + 
 
         query_indices = None
         if self.delta_indices is not None:
