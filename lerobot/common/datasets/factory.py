@@ -34,8 +34,10 @@ IMAGENET_STATS = {
 
 
 def resolve_delta_timestamps(
-    cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
-) -> dict[str, list] | None:
+    cfg: PreTrainedConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    use_trajectory_random_window: bool = True,
+) -> tuple[dict[str, list] | None, dict | None]:
     """Resolves delta_timestamps by reading from the 'delta_indices' properties of the PreTrainedConfig.
 
     Args:
@@ -71,23 +73,29 @@ def resolve_delta_timestamps(
             and "right_ee_position" in ds_meta.features
         )
 
-    chunk_keys = ["action"]
-    if uses_trajectory:
-        chunk_keys.extend(["left_ee_position", "right_ee_position"])
+    action_chunk_keys = ["action"]
+    trajectory_chunk_keys = ["left_ee_position", "right_ee_position"] if uses_trajectory else []
+    trajectory_random_window = (
+        getattr(cfg, "trajectory_random_window", None) if use_trajectory_random_window else None
+    )
 
+    # When trajectory_random_window is set, trajectory uses per-sample random window; exclude from delta_timestamps.
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
-        if key in chunk_keys and cfg.action_delta_indices is not None:
+        if key in action_chunk_keys and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
+        if key in trajectory_chunk_keys and trajectory_random_window is None:
+            if cfg.action_delta_indices is not None:
+                delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
-    return delta_timestamps
+    return delta_timestamps, trajectory_random_window if uses_trajectory else None
 
 
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
@@ -110,12 +118,13 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        delta_timestamps, trajectory_random_window = resolve_delta_timestamps(cfg.policy, ds_meta)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
             episodes=cfg.dataset.episodes,
             delta_timestamps=delta_timestamps,
+            trajectory_random_window=trajectory_random_window,
             image_transforms=image_transforms,
             revision=cfg.dataset.revision,
             video_backend=cfg.dataset.video_backend,

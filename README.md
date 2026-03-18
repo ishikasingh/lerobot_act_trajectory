@@ -65,6 +65,10 @@ python lerobot/scripts/control_robot.py --robot.type=trossen_ai_stationary --con
 
  2026-03-15 22:01:26,613 INFO Pinggy tunnel: https://gtrlc-3-133-43-206.a.free.pinggy.link
 
+--control.molmo_checkpoint: http://lvtoa-3-133-43-206.a.free.pinggy.link
+
+
+
 #  --host 0.0.0.0 --port 5050 --device cuda
 
 

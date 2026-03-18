@@ -364,7 +364,7 @@ class ACT(nn.Module):
         if self.config.trajectory_feature:
             # trajectory_feature.shape[0] = chunk_size * 6 (left_ee_position + right_ee_position concatenated).
             self.encoder_trajectory_input_proj = nn.Linear(
-                30 * 6, config.dim_model
+                30 * 4, config.dim_model
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
@@ -500,6 +500,8 @@ class ACT(nn.Module):
             if trajectory.shape[1] == 100:
                 idxs = torch.linspace(0, 99, 30).long().to(trajectory.device)
                 trajectory = trajectory[:, idxs, :]
+            # only train on x-y coordinates idx = 0,1,3,4
+            trajectory = trajectory[:, :, [0,1,3,4]]
             # import ipdb; ipdb.set_trace()
             trajectory = einops.rearrange(trajectory, "b s d -> b (s d)")  # (B, chunk_size*6)
             encoder_in_tokens.append(self.encoder_trajectory_input_proj(trajectory))

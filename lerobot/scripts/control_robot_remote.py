@@ -26,6 +26,7 @@ import base64
 import io
 import json
 import logging
+import pdb
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -507,11 +508,12 @@ def dataset_replay(
         )
 
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
-    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    delta_timestamps, trajectory_random_window = resolve_delta_timestamps(cfg.policy, ds_meta, use_trajectory_random_window=True)
     dataset = LeRobotDataset(
         cfg.repo_id,
         root=cfg.root,
         delta_timestamps=delta_timestamps,
+        trajectory_random_window=trajectory_random_window,
     )
     episode_start = dataset.episode_data_index["from"][cfg.episode].item()
     episode_end = dataset.episode_data_index["to"][cfg.episode].item()
@@ -577,9 +579,9 @@ def dataset_replay(
         molmo_client = _create_molmo_client(str(cfg.molmo_checkpoint))
         logging.info(f"Using remote Molmo at {cfg.molmo_checkpoint}")
 
-    # Connect robot AFTER loading all models to minimize idle time.
-    # if not robot.is_connected:
-    #     robot.connect()
+    # # Connect robot AFTER loading all models to minimize idle time.
+    if not robot.is_connected:
+        robot.connect()
 
     record_video = cfg.video_output_dir is not None
     video_frames: dict[str, list[np.ndarray]] = {}
@@ -590,10 +592,12 @@ def dataset_replay(
     cam_high_key = "observation.images.cam_high"
 
     # log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
-    for idx in range(episode_start, episode_end):
+    # for idx in range(episode_start, episode_end):
+    for idx in range(0, 600):
         start_t = time.perf_counter()
 
-        frame = dataset[idx]
+        # import ipdb; ipdb.set_trace()
+        frame = dataset[episode_start + idx]
         if robot.is_connected:
             robot_obs = robot.capture_observation()
         else:
@@ -607,7 +611,18 @@ def dataset_replay(
 
         batch = dict(robot_obs)
 
-        if molmo_client is not None and (idx % 50 == 0 or idx == episode_start):
+        
+
+        num_tasks = len(TASKS)
+        frames_per_task = (episode_end - episode_start) // num_tasks
+        task_idx = min(idx // frames_per_task, num_tasks - 1)
+        task_instruction = TASKS[task_idx]
+        task_instruction = cfg.molmo_instruction
+        print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
+
+        inference_freq = 5
+
+        if molmo_client is not None and (idx % inference_freq == 0 or idx == episode_start):
             cam_img = robot_obs.get(cam_high_key)
             if cam_img is None:
                 cam_img = next(v for k, v in robot_obs.items() if "image" in k)
@@ -617,17 +632,13 @@ def dataset_replay(
             if img_np.dtype in (np.float32, np.float64):
                 img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
 
-            left_ee_curr, right_ee_curr = _state_to_ee(frame["observation.state"])
+            left_ee_curr, right_ee_curr = _state_to_ee(robot_obs["observation.state"])
             left_ee_curr = _world_to_camera(left_ee_curr, frame["head_camera_position"], frame["head_camera_quat_xyzw"])
             right_ee_curr = _world_to_camera(right_ee_curr, frame["head_camera_position"], frame["head_camera_quat_xyzw"])
 
             initial_ee = np.concatenate([left_ee_curr, right_ee_curr])
 
-            num_tasks = len(TASKS)
-            frames_per_task = (episode_end - episode_start) // num_tasks
-            task_idx = min(idx // frames_per_task, num_tasks - 1)
-            task_instruction = TASKS[task_idx]
-            print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
+            
 
             traj_np = molmo_client.predict(
                 image=img_np,
@@ -644,13 +655,15 @@ def dataset_replay(
             batch["left_ee_position"] = _interp1d_torch(recovered[:, :3], 100)
             batch["right_ee_position"] = _interp1d_torch(recovered[:, 3:6], 100)
 
-            if idx % 50 == 0 or idx == episode_start:
+            previous_traj = batch["left_ee_position"], batch["right_ee_position"]
+
+            if idx % inference_freq == 0 or idx == episode_start:
                 fk_out = compute_fk_for_frame(
                     fk_model, fk_data,
                     np.asarray(
-                        frame["observation.state"].cpu().numpy()
-                        if isinstance(frame["observation.state"], torch.Tensor)
-                        else frame["observation.state"],
+                        robot_obs["observation.state"].cpu().numpy()
+                        if isinstance(robot_obs["observation.state"], torch.Tensor)
+                        else robot_obs["observation.state"],
                         dtype=np.float64,
                     ).ravel(),
                     state_names, state_to_q, fk_frame_ids,
@@ -697,9 +710,17 @@ def dataset_replay(
                 save_path = save_dir / f"frame_{idx:06d}.png"
                 cv2.imwrite(str(save_path), vis_img)
                 logging.info(f"Saved EE overlay frame to {save_path}")
-        else:
+            # import ipdb; ipdb.set_trace()
+        elif molmo_client is None and (idx % inference_freq == 0 or idx == episode_start):  # If not using Molmo, just fill in the GT EE positions from the dataset for visualization.
             batch["left_ee_position"] = frame["left_ee_position"]
             batch["right_ee_position"] = frame["right_ee_position"]
+        else:
+            batch["left_ee_position"], batch["right_ee_position"] = previous_traj
+        
+
+
+        batch['left_ee_position'][:, -1] = frame['left_ee_position'][:, -1].to('cuda') # Visualize predicted trajectory slightly to the right of GT for clarity.
+        batch['right_ee_position'][:, -1] = frame['right_ee_position'][:, -1].to('cuda') # Visualize predicted trajectory slightly to the right of GT for clarity.
 
         action = predict_action(batch, policy, device, policy.config.use_amp)
 
@@ -720,6 +741,12 @@ def dataset_replay(
                         cam_pos = cam_pos.cpu().numpy()
                     if isinstance(cam_quat, torch.Tensor):
                         cam_quat = cam_quat.cpu().numpy()
+                    gt_left = frame["left_ee_position"]
+                    gt_right = frame["right_ee_position"]
+                    if isinstance(gt_left, torch.Tensor):
+                        gt_left = gt_left.cpu().numpy()
+                    if isinstance(gt_right, torch.Tensor):
+                        gt_right = gt_right.cpu().numpy()
                     img = _draw_ee_trajectory_on_image_colored(
                         img, cam_pos, cam_quat, gt_left, gt_right,
                         left_label="L_gt", right_label="R_gt",

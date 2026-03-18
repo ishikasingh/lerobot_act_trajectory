@@ -152,6 +152,8 @@ from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
 
+import tqdm
+
 import cv2
 import numpy as np
 import torch
@@ -703,11 +705,14 @@ def dataset_replay(
     # Load dataset and policy BEFORE connecting the robot so the base hardware
     # doesn't time out while we download data / load model weights.
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
-    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    delta_timestamps, trajectory_random_window = resolve_delta_timestamps(
+        cfg.policy, ds_meta, use_trajectory_random_window=True
+    )
     dataset = LeRobotDataset(
         cfg.repo_id,
         root=cfg.root,
         delta_timestamps=delta_timestamps,
+        trajectory_random_window=trajectory_random_window,
     )
     episode_start = dataset.episode_data_index["from"][cfg.episode].item()
     episode_end = dataset.episode_data_index["to"][cfg.episode].item()
@@ -795,13 +800,14 @@ def dataset_replay(
     cam_high_key = "observation.images.cam_high"
 
     # log_say("Dataset replay: running policy conditioned on trajectory", cfg.play_sounds, blocking=True)
-    for idx in range(episode_start, episode_end):
+    # for idx in range(episode_start, episode_end):
+    for idx in tqdm.tqdm(range(0, 600), desc="Dataset replay"):
         start_t = time.perf_counter()
 
         # if idx % 100 != 0:
         #     continue
 
-        frame = dataset[idx]
+        frame = dataset[episode_start + idx]
         if robot.is_connected:
             robot_obs = robot.capture_observation()
         else:
@@ -814,6 +820,14 @@ def dataset_replay(
             }
 
         batch = dict(robot_obs)
+
+        # Assign task instructions uniformly as idx increases through total frames
+        num_tasks = len(TASKS)
+        # Uniform split: assign first N/num_tasks frames to task 0, next N/num_tasks to task 1, etc.
+        frames_per_task = (episode_end - episode_start) // num_tasks
+        task_idx = min(idx // frames_per_task, num_tasks - 1)  # Ensure doesn't go out of range for last task
+        task_instruction = TASKS[task_idx]
+        print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
 
         if molmo_predictor is not None and (idx % 50 == 0 or idx == episode_start):
             # Predict EE positions from the live camera image using Molmo.
@@ -836,13 +850,7 @@ def dataset_replay(
             # left_ee_curr = torch.from_numpy(left_ee_curr).to(device)
             # right_ee_curr = torch.from_numpy(right_ee_curr).to(device)
 
-            # Assign task instructions uniformly as idx increases through total frames
-            num_tasks = len(TASKS)
-            # Uniform split: assign first N/num_tasks frames to task 0, next N/num_tasks to task 1, etc.
-            frames_per_task = (episode_end - episode_start) // num_tasks
-            task_idx = min(idx // frames_per_task, num_tasks - 1)  # Ensure doesn't go out of range for last task
-            task_instruction = TASKS[task_idx]
-            print(f"Task instruction: {task_idx} / {num_tasks}: {task_instruction}")
+            
             traj_np = molmo_predictor.predict(
                 image=img_np,
                 instruction=task_instruction,
@@ -968,6 +976,14 @@ def dataset_replay(
                         cam_pos = cam_pos.cpu().numpy()
                     if isinstance(cam_quat, torch.Tensor):
                         cam_quat = cam_quat.cpu().numpy()
+
+                    # Ground-truth EE trajectory from dataset
+                    gt_left = frame["left_ee_position"]
+                    gt_right = frame["right_ee_position"]
+                    if isinstance(gt_left, torch.Tensor):
+                        gt_left = gt_left.cpu().numpy()
+                    if isinstance(gt_right, torch.Tensor):
+                        gt_right = gt_right.cpu().numpy()
                     img = _draw_ee_trajectory_on_image_colored(
                         img, cam_pos, cam_quat, gt_left, gt_right,
                         # left_color=(0, 255, 0), right_color=(0, 255, 255),

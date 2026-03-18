@@ -543,11 +543,14 @@ def dataset_replay(
         )
 
     ds_meta = LeRobotDatasetMetadata(cfg.repo_id, root=cfg.root)
-    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+    delta_timestamps, trajectory_random_window = resolve_delta_timestamps(
+        cfg.policy, ds_meta, use_trajectory_random_window=True
+    )
     dataset = LeRobotDataset(
         cfg.repo_id,
         root=cfg.root,
         delta_timestamps=delta_timestamps,
+        trajectory_random_window=trajectory_random_window,
     )
     episode_start = dataset.episode_data_index["from"][cfg.episode].item()
     episode_end = dataset.episode_data_index["to"][cfg.episode].item()

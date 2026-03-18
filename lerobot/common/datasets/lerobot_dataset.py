@@ -15,6 +15,7 @@
 # limitations under the License.
 import contextlib
 import logging
+import random
 import re
 import shutil
 from pathlib import Path
@@ -405,6 +406,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         episodes: list[int] | None = None,
         image_transforms: Callable | None = None,
         delta_timestamps: dict[list[float]] | None = None,
+        trajectory_random_window: dict | None = None,
         tolerance_s: float = 1e-4,
         revision: str | None = None,
         force_cache_sync: bool = False,
@@ -518,6 +520,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
+        self.trajectory_random_window = trajectory_random_window
         self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
@@ -739,6 +742,31 @@ class LeRobotDataset(torch.utils.data.Dataset):
         }
         return query_indices, padding
 
+    def _get_trajectory_random_window_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
+        """Generate random 100-frame window for trajectory keys. Window start in [-100, 0]."""
+        if self.trajectory_random_window is None or "left_ee_position" not in self.features:
+            return {}, {}
+
+        query_ep_idx = list(self.meta.episodes.keys()).index(ep_idx)
+        ep_start = self.episode_data_index["from"][query_ep_idx].item()
+        ep_end = self.episode_data_index["to"][query_ep_idx].item()
+
+        chunk_size = self.trajectory_random_window["chunk_size"]
+        start_min, start_max = self.trajectory_random_window["start_range"]
+        start = random.randint(start_min, start_max)
+        deltas = list(range(start, start + chunk_size))
+
+        trajectory_keys = [k for k in ("left_ee_position", "right_ee_position") if k in self.features]
+        query_indices = {
+            key: [max(ep_start, min(ep_end - 1, idx + d)) for d in deltas]
+            for key in trajectory_keys
+        }
+        padding = {
+            f"{key}_is_pad": torch.BoolTensor([(idx + d < ep_start) | (idx + d >= ep_end) for d in deltas])
+            for key in trajectory_keys
+        }
+        return query_indices, padding
+
     def _get_query_timestamps(
         self,
         current_ts: float,
@@ -797,6 +825,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+
+        if self.trajectory_random_window is not None:
+            traj_indices, traj_padding = self._get_trajectory_random_window_indices(idx, ep_idx)
+            if traj_indices:
+                traj_result = self._query_hf_dataset(traj_indices)
+                item = {**item, **traj_padding, **traj_result}
 
         if len(self.meta.video_keys) > 0:
             current_ts = item["timestamp"].item()

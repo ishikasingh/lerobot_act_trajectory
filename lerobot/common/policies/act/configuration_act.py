@@ -186,5 +186,11 @@ class ACTConfig(PreTrainedConfig):
         return list(range(self.chunk_size))
 
     @property
+    def trajectory_random_window(self) -> dict | None:
+        """Config for random trajectory chunking: chunk_size=100, start randomly in [-100, 0].
+        E.g. window could be [-90,10], [-50,50], or [-20,80]. Returns None to use fixed indices."""
+        return {"chunk_size": self.chunk_size, "start_range": (-100, 0)}
+
+    @property
     def reward_delta_indices(self) -> None:
         return None
