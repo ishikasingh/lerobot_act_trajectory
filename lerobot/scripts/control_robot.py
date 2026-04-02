@@ -735,7 +735,7 @@ def dataset_replay(
     fk_model = _load_urdf(urdf_path)
     fk_data = fk_model.createData()
 
-    stats_path = "/root/lerobot/aloha_play_dataset_part_3_with_fk_full/trajectory_stats.json"
+    stats_path =f"/root/lerobot/data_processing/trajectory_stats.json"
     stats = json.load(open(stats_path))
     mean = torch.tensor(stats["trajectory_stats_mean"]).to(device)
     std = torch.tensor(stats["trajectory_stats_std"]).to(device)

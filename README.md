@@ -54,7 +54,8 @@
 
 --- molmo trajectory prediction ---
 ```bash
-python lerobot/scripts/train.py     --dataset.repo_id=ishika/aloha_play_dataset_part_3_with_fk_full  --dataset.root=/root/sky_workdir/FAR-affordance/molmo/aloha_play_dataset_part_3_with_fk_full  --policy.type=act --output_dir=outputs/train/aloha_molmo --job_name=act_aloha_molmo --wandb.enable=true --policy.use_trajectory=true --save_freq=1000
+python lerobot/scripts/train.py     --dataset.repo_id=ishika/aloha_play_dataset_part_3_with_fk_full  --dataset.root=/root/sky_workdir/FAR-affordance/molmo/aloha_play_dataset_part_3_with_fk_full  --policy.type=act --output_dir=outputs/train/aloha_molmo --job_name=act_aloha_molmo --wandb.enable=true --policy.use_trajectory=true 
+
 
 
 python lerobot/scripts/control_robot.py --robot.type=trossen_ai_stationary --control.type=dataset_replay --control.repo_id=ishika/aloha_play_dataset_part_3_with_fk_full --control.episode=0 --control.policy.path=outputs/train/act_trossen_ai_stationary_30steps_traj/checkpoints/100000/pretrained_model --control.fps=30 --control.tags='["tutorial"]' --control.warmup_time_s=5 --control.episode_time_s=30 --control.reset_time_s=30 --control.num_episodes=10 --control.push_to_hub=true --control.num_image_writer_processes=1 --control.single_task="test" --control.root=aloha_play_dataset_part_3_with_fk_full --control.molmo_checkpoint= --control.molmo_instruction='stir the pot'

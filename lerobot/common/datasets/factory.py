@@ -118,7 +118,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
-        delta_timestamps, trajectory_random_window = resolve_delta_timestamps(cfg.policy, ds_meta)
+        delta_timestamps, trajectory_random_window = resolve_delta_timestamps(cfg.policy, 
+                                                        ds_meta, 
+                                                        use_trajectory_random_window=False)
         dataset = LeRobotDataset(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
